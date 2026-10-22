@@ -1,0 +1,8 @@
+MetaTrader5>=5.0.45
+fastapi>=0.110
+uvicorn[standard]>=0.29
+websockets>=12.0
+pandas>=2.1
+numpy>=1.26
+# pandas-ta é opcional: o motor usa cálculos vetorizados próprios (app/indicators.py),
+# evitando incompatibilidades conhecidas do pandas-ta com numpy 2.x.

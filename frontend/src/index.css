@@ -1,0 +1,42 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+html,
+body,
+#root {
+  min-height: 100vh;
+}
+
+body {
+  font-feature-settings: "tnum" 1, "cv11" 1;
+}
+
+.num {
+  font-family: theme("fontFamily.mono");
+  font-variant-numeric: tabular-nums;
+}
+
+.panel {
+  @apply rounded-md border border-ink-700 bg-ink-900;
+}
+
+.panel-title {
+  @apply flex items-center gap-2 border-b border-ink-700 px-3 py-2 text-[11px] font-semibold uppercase tracking-wider text-slate-400;
+}
+
+.field {
+  @apply w-full rounded border border-ink-600 bg-ink-850 px-2 py-1 text-xs text-slate-100 outline-none focus:border-accent;
+}
+
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-track {
+  background: #0a0e15;
+}
+::-webkit-scrollbar-thumb {
+  background: #243044;
+  border-radius: 4px;
+}
