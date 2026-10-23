@@ -1,6 +1,6 @@
 import { memo, useEffect, useState } from "react";
-import { Award, CheckCircle2, Clock, History, Layers, TrendingDown, TrendingUp, XCircle } from "lucide-react";
-import type { CompletedTrade, HistoryMsg, Position } from "../types";
+import { Award, CheckCircle2, Clock, History, Layers, ShieldCheck, TrendingDown, TrendingUp, XCircle } from "lucide-react";
+import type { CompletedTrade, DayFinancials, HistoryMsg, Position } from "../types";
 import {
   cx,
   fmtDuration,
@@ -15,12 +15,13 @@ interface Props {
   history: HistoryMsg | null;
   digits: number;
   currency: string;
+  day?: DayFinancials;
 }
 
 const TH = "whitespace-nowrap px-2.5 py-1.5 text-left text-[10px] font-bold uppercase tracking-wider text-slate-400";
 const TD = "px-2.5 py-2 text-[11px] align-middle";
 
-function BottomPanelImpl({ positions, history, digits, currency }: Props) {
+function BottomPanelImpl({ positions, history, digits, currency, day }: Props) {
   const [tab, setTab] = useState<"hist" | "pos">("hist");
   const hasOpen = positions.length > 0;
 
@@ -40,9 +41,12 @@ function BottomPanelImpl({ positions, history, digits, currency }: Props) {
     avg_duration_s: 0,
   };
 
+  const aiDayNet = day?.ai_day_total ?? day?.total ?? 0;
+  const acctDayNet = day?.account_day_total ?? day?.total ?? 0;
+
   return (
     <div className="panel flex w-full flex-col overflow-hidden">
-      {/* CABEÇALHO DE ABAS + RESUMO FINANCEIRO */}
+      {/* CABEÇALHO DE ABAS + RESUMO FINANCEIRO SEPARADO */}
       <div className="flex flex-wrap items-center justify-between gap-2 border-b border-ink-700 bg-ink-850 px-2.5 py-2 text-xs">
         <div className="flex flex-wrap items-center gap-1.5">
           <button
@@ -55,7 +59,7 @@ function BottomPanelImpl({ positions, history, digits, currency }: Props) {
             )}
           >
             <History size={13} />
-            Histórico de Operações ({summary.total_trades})
+            Histórico ({summary.total_trades})
           </button>
 
           <button
@@ -70,16 +74,16 @@ function BottomPanelImpl({ positions, history, digits, currency }: Props) {
             )}
           >
             <Layers size={13} />
-            Operação em Andamento ({positions.length})
+            Operações Abertas ({positions.length})
             {hasOpen && <span className="num ml-1 font-extrabold">({fmtSigned(floating, currency)})</span>}
           </button>
         </div>
 
-        {/* PLACAR RESUMO DAS OPERAÇÕES */}
+        {/* PLACAR RESUMO DAS OPERAÇÕES COM SEPARAÇÃO IA VS CONTA */}
         <div className="flex flex-wrap items-center gap-2 text-[11px]">
           <div className="flex items-center gap-1 rounded bg-ink-900 px-2 py-1">
             <Award size={12} className="text-amber-400" />
-            <span className="text-slate-400">Acertos:</span>
+            <span className="text-slate-400">Taxa Acerto:</span>
             <b className="num text-white">{summary.win_rate.toFixed(0)}%</b>
             <span className="text-slate-500">
               ({summary.wins}V / {summary.losses}D)
@@ -89,16 +93,27 @@ function BottomPanelImpl({ positions, history, digits, currency }: Props) {
           {summary.avg_duration_s > 0 && (
             <div className="hidden items-center gap-1 rounded bg-ink-900 px-2 py-1 sm:flex">
               <Clock size={12} className="text-accent" />
-              <span className="text-slate-400">Tempo Médio:</span>
+              <span className="text-slate-400">Duração Média:</span>
               <b className="num text-slate-200">{fmtDuration(summary.avg_duration_s)}</b>
             </div>
           )}
 
-          <div className="flex items-center gap-1.5 rounded border border-ink-700 bg-ink-900 px-2.5 py-1">
-            <span className="text-slate-400">Lucro Fechado:</span>
-            <b className={cx("num text-xs font-extrabold", pnlColor(summary.net_total))}>
-              {fmtSigned(summary.net_total, currency)}
-            </b>
+          {/* SEPARAÇÃO EXPLÍCITA: RESULTADO IA VS CONTA INTEIRA */}
+          <div className="flex items-center gap-2 rounded border border-ink-700 bg-ink-900 px-2.5 py-1">
+            <div className="flex items-center gap-1">
+              <span className="text-slate-400">IA Hoje:</span>
+              <b className={cx("num text-xs font-extrabold", pnlColor(aiDayNet))}>
+                {fmtSigned(aiDayNet, currency)}
+              </b>
+            </div>
+            {day?.protect_whole_account && (
+              <div className="flex items-center gap-1 border-l border-ink-700 pl-2">
+                <span className="text-slate-400">Conta Global:</span>
+                <b className={cx("num text-xs font-extrabold", pnlColor(acctDayNet))}>
+                  {fmtSigned(acctDayNet, currency)}
+                </b>
+              </div>
+            )}
           </div>
         </div>
       </div>
@@ -106,15 +121,15 @@ function BottomPanelImpl({ positions, history, digits, currency }: Props) {
       {/* CONTEÚDO: ABA DE HISTÓRICO */}
       {tab === "hist" ? (
         <>
-          {/* VISÃO NOTEBOOK / DESKTOP (4 COLUNAS ENCAIXADAS — 100% VISÍVEL SEM BARRA HORIZONTAL) */}
+          {/* VISÃO DESKTOP / NOTEBOOK */}
           <div className="hidden max-h-[290px] overflow-x-auto overflow-y-auto md:block">
             <table className="num w-full border-collapse">
               <thead className="sticky top-0 z-10 border-b border-ink-700 bg-ink-900">
                 <tr>
-                  <th className={TH}>Resultado Final</th>
-                  <th className={TH}>Ativo, Direção & Quem Operou</th>
-                  <th className={TH}>Horário (Início ➔ Fim) & Duração</th>
-                  <th className={TH}>Preços (Entrada ➔ Saída) & Término</th>
+                  <th className={TH}>Resultado Líquido</th>
+                  <th className={TH}>Ativo & Origem</th>
+                  <th className={TH}>Horário & Duração</th>
+                  <th className={TH}>Preços & Fechamento</th>
                 </tr>
               </thead>
               <tbody>
@@ -133,7 +148,6 @@ function BottomPanelImpl({ positions, history, digits, currency }: Props) {
                       t.won ? "bg-bull/[0.03]" : "bg-bear/[0.03]",
                     )}
                   >
-                    {/* 1. RESULTADO */}
                     <td className={TD}>
                       <div className="flex flex-col gap-0.5">
                         <span
@@ -143,7 +157,7 @@ function BottomPanelImpl({ positions, history, digits, currency }: Props) {
                           )}
                         >
                           {t.won ? <CheckCircle2 size={11} /> : <XCircle size={11} />}
-                          {t.won ? "GANHOU" : "PERDEU"}
+                          {t.won ? "LUCRO" : "LOSS"}
                         </span>
                         <span className={cx("text-xs font-extrabold", t.won ? "text-bull" : "text-bear")}>
                           {fmtSigned(t.net_profit, currency)}
@@ -151,7 +165,6 @@ function BottomPanelImpl({ positions, history, digits, currency }: Props) {
                       </div>
                     </td>
 
-                    {/* 2. ATIVO, DIREÇÃO E QUEM OPEROU */}
                     <td className={TD}>
                       <div className="flex items-center gap-1.5">
                         <span
@@ -180,7 +193,6 @@ function BottomPanelImpl({ positions, history, digits, currency }: Props) {
                       </div>
                     </td>
 
-                    {/* 3. HORÁRIO E DURAÇÃO */}
                     <td className={TD}>
                       <div className="text-slate-200">
                         <span>{fmtLocalDateTime(t.open_time_local)}</span>
@@ -194,7 +206,6 @@ function BottomPanelImpl({ positions, history, digits, currency }: Props) {
                       </div>
                     </td>
 
-                    {/* 4. PREÇOS E MOTIVO DE SAÍDA */}
                     <td className={TD}>
                       <div className="text-slate-300">
                         {fmtPrice(t.entry_price, digits)} <span className="text-slate-500">➔</span>{" "}
@@ -208,7 +219,7 @@ function BottomPanelImpl({ positions, history, digits, currency }: Props) {
             </table>
           </div>
 
-          {/* VISÃO CELULAR / TELAS PEQUENAS (CARDS COMPACTOS E FÁCEIS DE LER) */}
+          {/* VISÃO CELULAR / PEQUENAS TELAS */}
           <div className="divide-y divide-ink-800 md:hidden">
             {trades.length === 0 && (
               <div className="px-3 py-6 text-center text-xs text-slate-500">
@@ -226,7 +237,7 @@ function BottomPanelImpl({ positions, history, digits, currency }: Props) {
                       )}
                     >
                       {t.won ? <CheckCircle2 size={11} /> : <XCircle size={11} />}
-                      {t.won ? "GANHOU" : "PERDEU"}
+                      {t.won ? "LUCRO" : "LOSS"}
                     </span>
                     <span className={cx("font-bold", t.side === "BUY" ? "text-bull" : "text-bear")}>
                       {t.side === "BUY" ? "COMPRA" : "VENDA"}
@@ -263,7 +274,7 @@ function BottomPanelImpl({ positions, history, digits, currency }: Props) {
           </div>
         </>
       ) : (
-        /* CONTEÚDO: ABA DE OPERAÇÃO EM ANDAMENTO */
+        /* CONTEÚDO: ABA DE OPERAÇÕES ABERTAS COM CONFIRMAÇÃO DE SL E MFE/MAE */
         <div className="max-h-[290px] overflow-x-auto overflow-y-auto">
           <table className="num w-full border-collapse">
             <thead className="sticky top-0 z-10 border-b border-ink-700 bg-ink-900">
@@ -272,22 +283,23 @@ function BottomPanelImpl({ positions, history, digits, currency }: Props) {
                 <th className={TH}>Direção & Ativo</th>
                 <th className={TH}>Início & Tempo Aberta</th>
                 <th className={TH}>Entrada ➔ Atual</th>
-                <th className={TH}>Stop / Meta (TP)</th>
+                <th className={TH}>Proteção SL & Alvo TP</th>
+                <th className={TH}>Excursão (MFE / MAE)</th>
               </tr>
             </thead>
             <tbody>
               {positions.length === 0 && (
                 <tr>
-                  <td colSpan={5} className="px-3 py-8 text-center font-sans text-xs text-slate-500">
+                  <td colSpan={6} className="px-3 py-8 text-center font-sans text-xs text-slate-500">
                     Nenhuma operação aberta no momento. Clique na aba{" "}
-                    <b className="text-accent">Histórico de Operações ({summary.total_trades})</b> acima para ver todas
-                    as operações já concluídas e o lucro de cada uma.
+                    <b className="text-accent">Histórico ({summary.total_trades})</b> acima para ver todas as operações concluídas.
                   </td>
                 </tr>
               )}
               {positions.map((p) => {
                 const net = p.net_profit ?? p.profit + p.swap;
                 const winning = net >= 0;
+                const slConfirmed = p.sl_confirmed ?? (p.sl > 0);
                 return (
                   <tr key={p.ticket} className="border-t border-ink-800 hover:bg-ink-850">
                     <td className={TD}>
@@ -298,7 +310,7 @@ function BottomPanelImpl({ positions, history, digits, currency }: Props) {
                             winning ? "bg-bull text-ink-950" : "bg-bear text-white",
                           )}
                         >
-                          {winning ? "GANHANDO" : "PERDENDO"}
+                          {winning ? "LUCRO" : "RISCO"}
                         </span>
                         <span className={cx("text-xs font-extrabold", winning ? "text-bull" : "text-bear")}>
                           {fmtSigned(net, currency)}
@@ -324,10 +336,25 @@ function BottomPanelImpl({ positions, history, digits, currency }: Props) {
                       {fmtPrice(p.price_open, digits)} ➔ <b className="text-white">{fmtPrice(p.price_current, digits)}</b>
                     </td>
                     <td className={TD}>
-                      <div className={cx("text-[10.5px]", p.be_protected ? "font-bold text-bull" : "text-bear")}>
-                        SL: {fmtPrice(p.sl, digits)}
+                      <div className="flex items-center gap-1">
+                        <span className={cx("text-[10.5px]", p.be_protected ? "font-bold text-bull" : "text-bear")}>
+                          SL: {fmtPrice(p.sl, digits)}
+                        </span>
+                        {slConfirmed ? (
+                          <span title="SL confirmado no MT5" className="text-bull"><ShieldCheck size={11} /></span>
+                        ) : (
+                          <span title="SL não confirmado" className="text-bear font-bold">⚠️</span>
+                        )}
                       </div>
                       <div className="text-[10.5px] font-bold text-bull">TP: {fmtPrice(p.tp, digits)}</div>
+                    </td>
+                    <td className={TD}>
+                      <div className="text-[10px]">
+                        <span className="text-bull font-bold">MFE: +{(p.mfe_pts ?? 0).toFixed(1)} pts</span>
+                      </div>
+                      <div className="text-[10px]">
+                        <span className="text-bear font-bold">MAE: -{(p.mae_pts ?? 0).toFixed(1)} pts</span>
+                      </div>
                     </td>
                   </tr>
                 );

@@ -6,3 +6,9 @@ backend/.venv/
 backend/data/
 .runtime/
 .DS_Store
+*.dxvk-cache
+*.dat
+*.db
+*.db-wal
+*.db-shm
+.pytest_cache/

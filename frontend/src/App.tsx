@@ -62,6 +62,8 @@ export default function App() {
               currency={currency}
               spreadNow={snap?.tick.spread_points}
               lock={snap?.ai.lock}
+              guard={snap?.risk_guard}
+              day={snap?.day}
               send={send}
             />
           </div>
@@ -93,7 +95,13 @@ export default function App() {
               timing={snap?.timing}
             />
 
-            <BottomPanel positions={positions} history={history} digits={digits} currency={currency} />
+            <BottomPanel
+              positions={positions}
+              history={history}
+              digits={digits}
+              currency={currency}
+              day={snap?.day}
+            />
           </div>
 
           <div className="min-w-0 lg:col-span-5 xl:col-span-4">
@@ -105,6 +113,7 @@ export default function App() {
               radar={snap?.radar}
               activeSymbol={snap?.symbol ?? null}
               autoSymbol={meta?.settings.auto_select_symbol ?? true}
+              quant={snap?.quant}
               send={send}
             />
           </div>

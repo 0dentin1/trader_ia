@@ -1,5 +1,8 @@
 export type ModeKey = "LEVE" | "MEDIANO" | "ARRISCADO";
 export type Side = "BUY" | "SELL";
+export type DrawdownState = "NORMAL" | "CAUTION" | "REDUCED_EXPOSURE" | "TRADING_LOCKED" | "REVIEW_REQUIRED";
+export type AdaptiveMode = "OBSERVATION" | "SHADOW" | "ACTIVE";
+export type AccountProfile = "SMALL_ACCOUNT_PROTECTION" | "STANDARD";
 
 export interface ModeConfig {
   key: ModeKey;
@@ -31,6 +34,13 @@ export interface Settings {
   auto_select_symbol?: boolean;
   daily_loss_limit: number;
   daily_gain_target: number;
+  weekly_loss_limit?: number;
+  account_profile?: AccountProfile;
+  adaptive_mode?: AdaptiveMode;
+  protect_whole_account?: boolean;
+  session_loss_limit_pct?: number;
+  weekly_drawdown_limit_pct?: number;
+  broker_rollover_hour?: number;
   max_spread_points: number;
   risk_pct: Record<ModeKey, number>;
   lot_multiplier: number;
@@ -38,7 +48,15 @@ export interface Settings {
   sync_chart_symbol: boolean;
   deviation_points: number;
   magic: number;
-  risk_lock: { day: number; reason: string; at: string } | null;
+  risk_lock: {
+    active: boolean;
+    lock_type?: string;
+    reason: string | null;
+    at?: string | null;
+    scope?: string;
+    day?: number;
+    week?: number;
+  } | null;
 }
 
 export interface SymbolEntry {
@@ -50,6 +68,7 @@ export interface SymbolEntry {
 
 export interface MetaMsg {
   type: "meta";
+  algo_version?: string;
   modes: ModeConfig[];
   settings: Settings;
   symbols: SymbolEntry[];
@@ -205,6 +224,15 @@ export interface RadarEntry {
   reason: string;
 }
 
+export interface StructuralRoom {
+  status: "ADEQUATE" | "TIGHT" | "BLOCKED";
+  room_points: number;
+  room_atr: number;
+  nearest_level: number;
+  level_type: string;
+  min_room_atr: number;
+}
+
 export interface Analysis {
   ready: boolean;
   mode: ModeKey;
@@ -231,6 +259,9 @@ export interface Analysis {
   score_sell: number;
   direction: Side | null;
   signal: Side | null;
+  calibrated_win_probability?: number | null;
+  probability_category?: "HEURISTIC_CONFLUENCE" | "CALIBRATED_OOS";
+  structural_room?: StructuralRoom;
   pillars: Pillar[];
   gates: Gate[];
   study_block: string | null;
@@ -239,7 +270,7 @@ export interface Analysis {
   bar_time?: number;
   bar_remaining_s?: number;
   indicators: Record<string, number | null>;
-  htf?: { available: boolean; trend: number; bias21: number };
+  htf?: { available: boolean; trend: number; bias21: number; bar_dir?: number };
 }
 
 export interface Position {
@@ -268,6 +299,9 @@ export interface Position {
   sl_profit?: number | null;
   progress_pct?: number;
   be_protected?: boolean;
+  sl_confirmed?: boolean;
+  mfe_pts?: number;
+  mae_pts?: number;
 }
 
 export interface Deal {
@@ -326,12 +360,14 @@ export interface TradeSummary {
 export type AIState =
   | "OFF"
   | "DISCONNECTED"
+  | "WAITING_DATA_SYNC"
   | "STUDYING_MARKET"
   | "EVALUATING_CONFLUENCE"
   | "EXECUTING_TRADE"
   | "MANAGING_POSITION"
   | "COOLDOWN"
-  | "RISK_LOCK";
+  | "RISK_LOCK"
+  | "CRITICAL_EXECUTION_FAILURE";
 
 export interface AIStatus {
   enabled: boolean;
@@ -342,18 +378,31 @@ export interface AIStatus {
   cooldown_reason: string;
   active_brains?: number;
   max_concurrent?: number;
-  lock: { active: boolean; reason: string | null; at: string | null };
-  recovery?: { active: boolean; consecutive_losses: number; deficit: number };
+  lock: {
+    active: boolean;
+    lock_type?: string;
+    reason: string | null;
+    at?: string | null;
+    scope?: string;
+  };
+  adaptive_mode?: AdaptiveMode;
+  account_profile?: AccountProfile;
+  recovery?: { active: boolean; consecutive_losses: number; deficit: number; martingale_allowed?: boolean };
   managed: {
     ticket: number;
     symbol?: string;
     be_done: boolean;
+    sl_confirmed?: boolean;
     initial_sl: number;
     atr: number;
     mode: ModeKey;
     horizon_type?: string;
     horizon_label?: string;
     max_duration_s?: number;
+    mfe_pts?: number;
+    mae_pts?: number;
+    mfe_ccy?: number;
+    mae_ccy?: number;
   }[];
 }
 
@@ -379,6 +428,90 @@ export interface TimingInfo {
   server_offset_s: number;
 }
 
+export interface SmallAccountGuardSummary {
+  status: string;
+  approved: boolean;
+  reason: string;
+  profile: AccountProfile;
+  currency: string;
+  reference_equity: number;
+  drawdown_state: DrawdownState;
+  drawdown_reason: string;
+  risk_scale_factor: number;
+  target_risk_pct: number;
+  max_planned_risk_pct: number;
+  planned_risk_money: number;
+  effective_risk_pct: number;
+  effective_risk_money: number;
+  open_portfolio_risk_money: number;
+  open_portfolio_risk_pct: number;
+  max_aggregate_risk_pct: number;
+  volume_min: number;
+  min_lot_risk_money: number;
+  min_lot_risk_pct: number;
+  cost_to_risk_ratio: number;
+  max_cost_to_risk_ratio: number;
+  required_recovery_gain_pct: number;
+  session_loss_limit_money: number;
+  weekly_drawdown_limit_money: number;
+}
+
+export interface PerformanceReport {
+  sample_size: number;
+  wins: number;
+  losses: number;
+  win_rate: number;
+  expectancy: number;
+  profit_factor: number;
+  avg_mfe_points: number;
+  avg_mae_points: number;
+  calibration?: {
+    brier_score: number | null;
+    log_loss: number | null;
+    reliability_bins: { bin: string; predicted_avg: number; actual_win_rate: number; count: number }[];
+  };
+  by_strategy: Record<string, { sample_size: number; win_rate: number; expectancy: number; profit_factor: number }>;
+  by_regime: Record<string, { sample_size: number; win_rate: number; expectancy: number; profit_factor: number }>;
+}
+
+export interface QuantSummary {
+  algo_version: string;
+  adaptive?: {
+    rules?: any[];
+    mode?: AdaptiveMode;
+  };
+  performance?: PerformanceReport;
+  backtest?: any;
+}
+
+export interface DayFinancials {
+  realized: number;
+  floating: number;
+  total: number;
+  session_net?: number;
+  weekly_net?: number;
+  ai_realized_today?: number;
+  ai_floating?: number;
+  ai_day_total?: number;
+  ai_weekly_net?: number;
+  ai_realized_all_time?: number;
+  account_realized_today?: number;
+  account_floating?: number;
+  account_day_total?: number;
+  account_weekly_net?: number;
+  account_realized_all_time?: number;
+  reference_equity?: number;
+  session_start_equity?: number;
+  week_start_equity?: number;
+  baseline_used?: number;
+  protect_whole_account?: boolean;
+  scope_label?: string;
+  all_time?: number;
+  net_closed?: number;
+  trades_total?: number;
+  trades_wins?: number;
+}
+
 export interface SnapshotMsg {
   type: "snapshot";
   ts: number;
@@ -402,15 +535,9 @@ export interface SnapshotMsg {
   ai: AIStatus;
   radar?: RadarEntry[];
   positions: Position[];
-  day: {
-    realized: number;
-    floating: number;
-    total: number;
-    all_time?: number;
-    net_closed?: number;
-    trades_total?: number;
-    trades_wins?: number;
-  };
+  day: DayFinancials;
+  risk_guard?: SmallAccountGuardSummary;
+  quant?: QuantSummary;
 }
 
 export interface LogEntry {

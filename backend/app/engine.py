@@ -1,5 +1,6 @@
-"""Orquestrador do Motor V3 (MEGA BRAIN): 1 Cérebro Dedicado por Moeda (SymbolRuntime) com fluxo de ticks
-próprio, leitura simultânea M1+M2+M5+M15, escolha automática de Horizonte (1 Vela a 5 min) e WebSocket."""
+"""Orquestrador do Motor V5 (MEGA BRAIN QUANT): 1 Cérebro Dedicado por Moeda (SymbolRuntime) com fluxo de ticks
+próprio, leitura simultânea M1+M2+M5+M15, Governança Independente de Risco, Proteção de Pequenas Contas,
+Memória Quantitativa SQLite, Adaptação Controlada e WebSocket."""
 from __future__ import annotations
 
 import asyncio
@@ -15,13 +16,33 @@ from typing import Any
 import pandas as pd
 
 from . import indicators
+from .adaptive_rules import AdaptiveRulesEngine
 from .analysis import analyze_multi_horizon
+from .backtest import run_walk_forward_validation
 from .brain import Brain, Ctx
-from .config import ACTIVE_SYMBOL_FILE, ENGINE_CYCLE_S, MODES, RECONNECT_INTERVAL_S, TF_BARS, TF_SECONDS
+from .config import (
+    ACTIVE_SYMBOL_FILE,
+    ADAPTIVE_MODES,
+    ALGO_VERSION,
+    ENGINE_CYCLE_S,
+    MODES,
+    RECONNECT_INTERVAL_S,
+    TF_BARS,
+    TF_SECONDS,
+)
 from .flow import TickFlow
 from .mt5_bridge import MT5Bridge
-from .risk import realized_today, summarize_trades
-from .settings_store import SettingsStore
+from .performance import build_performance_report
+from .risk import (
+    build_plan,
+    compute_financial_breakdown,
+    evaluate_portfolio_protection,
+    resolve_profile_limits,
+    summarize_trades,
+)
+from .settings_store import SettingsStore, compute_trading_day, compute_trading_week
+from .small_account_guard import classify_drawdown_state, evaluate_small_account_guard
+from .trade_journal import TradeJournal
 from .utils import LogBook, clean
 
 SCAN_BARS_M1 = 320
@@ -49,11 +70,16 @@ class SymbolRuntime:
 
 
 class Engine:
-    def __init__(self) -> None:
+    def __init__(self, journal: TradeJournal | None = None) -> None:
         self.store = SettingsStore()
         self.logs = LogBook()
         self.bridge = MT5Bridge()
-        self.brain = Brain(self.bridge, self.store, self.logs)
+        self.journal = journal or TradeJournal()
+        self.adaptive = AdaptiveRulesEngine(
+            self.journal,
+            mode=str(self.store.get("adaptive_mode") or "OBSERVATION"),
+        )
+        self.brain = Brain(self.bridge, self.store, self.logs, journal=self.journal, adaptive=self.adaptive)
         self.loop: asyncio.AbstractEventLoop | None = None
         self._cmds: "queue.Queue[tuple[dict, asyncio.Future]]" = queue.Queue()
         self._thread: threading.Thread | None = None
@@ -96,12 +122,35 @@ class Engine:
             "realized": 0.0,
             "floating": 0.0,
             "total": 0.0,
+            "session_net": 0.0,
+            "weekly_net": 0.0,
+            "ai_realized_today": 0.0,
+            "ai_floating": 0.0,
+            "ai_day_total": 0.0,
+            "ai_weekly_net": 0.0,
+            "ai_realized_all_time": 0.0,
+            "account_realized_today": 0.0,
+            "account_floating": 0.0,
+            "account_day_total": 0.0,
+            "account_weekly_net": 0.0,
+            "account_realized_all_time": 0.0,
+            "reference_equity": 0.0,
+            "session_start_equity": 0.0,
+            "week_start_equity": 0.0,
+            "baseline_used": 0.0,
+            "protect_whole_account": False,
+            "scope_label": "TRADER_IA_MAGIC",
             "all_time": 0.0,
             "net_closed": 0.0,
             "trades_total": 0,
             "trades_wins": 0,
         }
+        self.risk_guard_summary: dict = {}
+        self.quant_summary: dict = {}
+        self.last_backtest_report: dict | None = None
+        self.server_time: int = 0
         self.server_day: int | None = None
+        self.server_week: int | None = None
         self.server_offset_s: int = 0
         self._series_key: tuple | None = None
         self._series_id = ""
@@ -116,8 +165,9 @@ class Engine:
         self._scan_idx = 0
         self._t = {
             k: 0.0
-            for k in ("connect", "account", "symbols", "hist", "sync", "scan", "auto_switch")
+            for k in ("connect", "account", "symbols", "hist", "sync", "scan", "auto_switch", "quant")
         }
+        self._refresh_quant_report()
 
     # ------------------------------------------------------------------ ciclo de vida
     def start(self, loop: asyncio.AbstractEventLoop) -> None:
@@ -139,7 +189,7 @@ class Engine:
         return fut
 
     def _run(self) -> None:
-        self.logs.add("🧠 Mega Brain V3 iniciado. Conectando ao MetaTrader 5...", "info")
+        self.logs.add(f"🧠 Mega Brain {ALGO_VERSION} iniciado. Conectando ao MetaTrader 5...", "info")
         while self._running:
             t0 = time.perf_counter()
             try:
@@ -203,7 +253,7 @@ class Engine:
             self.store.set("mode", key)
             self.logs.add(
                 f"Nível de Rigor do Mega Brain alterado: {MODES[old].label} → {MODES[key].label} "
-                f"(Certeza Sniper ≥ {MODES[key].min_score:.0f}%)",
+                f"(Score Heurístico ≥ {MODES[key].min_score:.0f})",
                 "info",
                 key,
             )
@@ -219,6 +269,8 @@ class Engine:
                     self.store.snapshot(),
                     self.server_day,
                     current_day_total=float(self.day.get("total") or 0.0),
+                    server_time=self.server_time or None,
+                    current_week_total=float(self.day.get("weekly_net") or 0.0),
                 )
             self.brain.disable("Desligada pelo operador.")
             return True, "Mega Brain desligado."
@@ -250,12 +302,69 @@ class Engine:
             patch = cmd.get("settings") or {}
             ok, msg = self.store.update_user(patch, current_day_total=float(self.day.get("total") or 0.0))
             if ok:
+                new_adapt = self.store.get("adaptive_mode")
+                if new_adapt in ADAPTIVE_MODES:
+                    self.adaptive.set_mode(str(new_adapt))
                 if self.brain.state == "RISK_LOCK" and self.store.get("risk_lock") is None:
                     self.brain.state = "STUDYING_MARKET" if self.brain.enabled else "OFF"
-                    self.brain.detail = "Limites atualizados — pronto para operar."
-                self.logs.add(f"Limites de proteção atualizados: {json.dumps(patch, ensure_ascii=False)}", "info")
+                    self.brain.detail = "Meta atualizada — pronto para operar."
+                self.logs.add(f"Configurações atualizadas: {json.dumps(patch, ensure_ascii=False)}", "info")
+                self._refresh_quant_report()
                 self._publish_meta()
             return ok, msg
+        if action == "unlock_risk_lock":
+            reason = str(cmd.get("reason") or "Desbloqueio manual pelo operador")
+            reset_base = bool(cmd.get("reset_baseline", False))
+            ok, msg = self.store.manual_unlock_risk_lock(
+                operator_note=reason,
+                current_day_total=float(self.day.get("total") or 0.0),
+                reset_baseline=reset_base,
+            )
+            if ok:
+                self.brain.state = "STUDYING_MARKET" if self.brain.enabled else "OFF"
+                self.brain.detail = msg
+                self.logs.add(f"🔓 [AUDITORIA DE RISCO] {msg} ({reason})", "warn")
+                self._publish_meta()
+            return ok, msg
+        if action == "set_adaptive_mode":
+            mode_str = str(cmd.get("adaptive_mode") or "").upper()
+            if mode_str not in ADAPTIVE_MODES:
+                return False, f"Modo adaptativo inválido ({mode_str})."
+            self.store.set("adaptive_mode", mode_str)
+            self.adaptive.set_mode(mode_str)
+            self._refresh_quant_report()
+            self._publish_meta()
+            self.logs.add(f"Modo de Adaptação Quantitativa alterado para {mode_str}.", "info")
+            return True, f"Modo adaptativo {mode_str} ativado."
+        if action == "run_backtest":
+            if not self.symbol or self.symbol not in self.runtimes:
+                return False, "Nenhum ativo carregado com histórico para backtest."
+            rt = self.runtimes[self.symbol]
+            df_m1 = rt.dfs.get("M1")
+            if df_m1 is None or len(df_m1) < 200:
+                return False, "Histórico M1 insuficiente em memória para validação walk-forward."
+            settings = self.store.snapshot()
+            mode_cfg = MODES[settings["mode"]]
+            rep = run_walk_forward_validation(
+                symbol=self.symbol,
+                df_m1=df_m1,
+                df_m2=rt.dfs.get("M2"),
+                df_m5=rt.dfs.get("M5"),
+                df_m15=rt.dfs.get("M15"),
+                sym_info=rt.info,
+                mode=mode_cfg,
+                settings=settings,
+                initial_capital=float(self.account.get("balance") or 1000.0),
+                currency=str(self.account.get("currency") or "USD"),
+            )
+            self.last_backtest_report = rep
+            self._refresh_quant_report()
+            verdict = rep.get("verdict", {})
+            self.logs.add(
+                f"📊 [BACKTEST WALK-FORWARD · {self.symbol}] Status: {verdict.get('status')} — {verdict.get('summary')}",
+                "info",
+            )
+            return True, verdict.get("summary") or "Backtest concluído."
         if action == "refresh_symbols":
             if not self.bridge.connected:
                 return False, "MT5 desconectado."
@@ -263,6 +372,99 @@ class Engine:
             self._publish_meta()
             return True, f"{len(self.symbols)} símbolos visíveis no Market Watch."
         return False, f"Ação desconhecida: {action}"
+
+    # ------------------------------------------------------------------ relatório quantitativo e guarda de risco
+    def _refresh_quant_report(self) -> None:
+        try:
+            perf = build_performance_report(
+                journal=self.journal,
+                reference_equity=float(self.account.get("equity") or 0.0),
+            )
+            closed_trades = self.journal.fetch_closed_trades(limit=500)
+            adapt_summary = self.adaptive.refresh_from_history(closed_trades)
+            self.quant_summary = {
+                "algo_version": ALGO_VERSION,
+                "adaptive": adapt_summary,
+                "performance": perf,
+                "backtest": self.last_backtest_report,
+            }
+        except Exception as exc:  # noqa: BLE001
+            self.quant_summary = {
+                "algo_version": ALGO_VERSION,
+                "error": repr(exc),
+            }
+
+    def _compute_live_risk_guard_summary(self, mode, settings: dict) -> dict:
+        ccy = str(self.account.get("currency") or "USD")
+        balance = float(self.account.get("balance") or 0.0)
+        equity = float(self.account.get("equity") or 0.0)
+        ref_eq = min(balance, equity) if (balance > 0 and equity > 0) else max(balance, equity, 0.0)
+        profile_limits = resolve_profile_limits(settings)
+        ss = settings.get("session_state") or {}
+        session_pnl = float(self.day.get("session_net") or 0.0)
+        weekly_pnl = float(self.day.get("weekly_net") or 0.0)
+
+        sym_info_map = {
+            k: v.info for k, v in self.runtimes.items() if v.info is not None
+        }
+        portfolio = evaluate_portfolio_protection(
+            bridge=self.bridge,
+            open_positions=self.positions,
+            candidate_symbol=self.symbol,
+            candidate_side=(self.analysis.get("direction") if self.analysis else None),
+            symbol_map=sym_info_map,
+        )
+
+        # Se tivermos símbolo ativo e ATR, avalia o plano simulado no lote mínimo para mostrar no painel
+        vmin = float((self.sym or {}).get("volume_min") or 0.01)
+        atr = float((self.analysis or {}).get("atr") or 0.0)
+        loss_1 = 0.0
+        cost_1 = 0.0
+        if self.symbol and self.sym and self.tick and atr > 0:
+            side = str((self.analysis or {}).get("direction") or "BUY")
+            d = 1 if side == "BUY" else -1
+            entry = float(self.tick.get("ask") if side == "BUY" else self.tick.get("bid") or 0.0)
+            point = float(self.sym.get("point") or 1e-9)
+            spread = max(0.0, float(self.tick.get("ask") or 0.0) - float(self.tick.get("bid") or 0.0))
+            sl_dist = max(mode.sl_atr * atr, (int(self.sym.get("stops_level") or 0) + 2) * point + spread, 12 * point + spread)
+            sl = self.bridge.norm_price(entry - d * sl_dist, self.sym)
+            loss_1 = float(self.bridge.loss_per_lot(self.symbol, side, entry, sl, self.sym) or 0.0)
+            slip_price = min(int(settings.get("deviation_points") or 20), 3) * point
+            cost_1 = loss_1 * (slip_price / max(sl_dist, 1e-9)) if loss_1 > 0 else 0.0
+
+        req_risk = min(
+            float(settings.get("risk_pct", {}).get(mode.key, mode.risk_default)),
+            profile_limits["target_risk_pct"]
+            if str(settings.get("account_profile")) == "SMALL_ACCOUNT_PROTECTION"
+            else profile_limits["max_planned_risk_pct"],
+        )
+
+        guard_eval = evaluate_small_account_guard(
+            account=self.account,
+            sym=self.sym or {"volume_min": vmin},
+            settings=settings,
+            requested_risk_pct=req_risk,
+            loss_per_lot_at_sl=loss_1 if loss_1 > 0 else max(0.01, ref_eq * 0.002 / max(vmin, 0.01)),
+            estimated_costs_per_lot=cost_1,
+            final_volume=vmin,
+            margin_required=0.0,
+            open_portfolio_risk_money=portfolio["aggregate_open_risk_money"],
+            session_pnl=session_pnl,
+            weekly_pnl=weekly_pnl,
+            has_unprotected_position=portfolio["has_unprotected_position"],
+            correlation_blocked_reason=portfolio["correlation_blocked_reason"],
+            data_integrity_error=(self.analysis.get("study_block") if self.analysis and not self.analysis.get("ready") else None),
+            execution_failure=bool(
+                isinstance(settings.get("risk_lock"), dict)
+                and settings["risk_lock"].get("lock_type") == "EXECUTION_LOCK"
+            ),
+        )
+        res = guard_eval.to_dict()
+        res["portfolio"] = portfolio
+        res["session_start_equity"] = float(ss.get("session_start_equity") or ref_eq)
+        res["week_start_equity"] = float(ss.get("week_start_equity") or ref_eq)
+        res["peak_reference_equity"] = float(ss.get("peak_reference_equity") or ref_eq)
+        return res
 
     # ------------------------------------------------------------------ gerenciamento de cérebros por moeda
     def _get_runtime(self, sym_name: str) -> SymbolRuntime:
@@ -296,7 +498,6 @@ class Engine:
             rt.last_tick_msc = int(tick.get("time_msc") or 0)
         rt.tick = tick
 
-        # Intervalos de atualização de velas por timeframe (mais rápido no ativo ativo ou com posição aberta)
         fast = is_active or has_open_pos
         m1_int = 0.8 if fast else 2.5
         m2_int = 2.0 if fast else 5.0
@@ -381,12 +582,10 @@ class Engine:
         now = time.monotonic()
         eff_min = self.brain.required_score(mode.min_score)
 
-        # 1. Atualiza no Radar a moeda atualmente aberta no gráfico
         if self.symbol and self.analysis.get("ready"):
             tf_sec = TF_SECONDS.get(self.analysis.get("timeframe", "M1"), 60)
             self._update_radar_entry(self.symbol, self.analysis, eff_min, server_now, tf_sec)
 
-        # 2. Sempre mantém atualizadas moedas que possuem operação aberta em segundo plano
         for osym in open_syms:
             if osym != self.symbol:
                 rt_o = self._update_symbol_runtime(osym, mode, settings, now, is_active=False, has_open_pos=True)
@@ -394,7 +593,6 @@ class Engine:
                     tf_s = TF_SECONDS.get(rt_o.analysis.get("timeframe", "M1"), 60)
                     self._update_radar_entry(osym, rt_o.analysis, eff_min, server_now, tf_s)
 
-        # 3. Escaneia lote de 2 outras moedas a cada 0.25s (varre todo o Market Watch em ~1s)
         if now - self._t["scan"] < 0.25:
             return
         self._t["scan"] = now
@@ -488,7 +686,6 @@ class Engine:
         if not self.radar:
             return False
 
-        # Se a moeda atual tem operação aberta, mantém o gráfico nela (a menos que outra acabe de disparar)
         if any(p["symbol"] == self.symbol for p in self.positions):
             return False
 
@@ -502,12 +699,11 @@ class Engine:
         cur_has_sig = bool(cur_entry and cur_entry.get("signal"))
         cur_rank = float(cur_entry.get("rank_score", 0.0)) if cur_entry else 0.0
 
-        # Só troca de gráfico no máximo a cada 8s (para sinal confirmado) ou 15s (para acompanhar #1)
         if best.get("signal") and not cur_has_sig and (now - self._t["auto_switch"] >= 8.0):
             self._t["auto_switch"] = now
             ok, _ = self._switch_symbol(
                 best_sym,
-                f"Cérebro {best_sym}: SINAL SNIPER {best['signal']} ({best['score']:.0f}% · {best.get('horizon_label', '1 Vela')})",
+                f"Cérebro {best_sym}: SINAL {best['signal']} ({best['score']:.0f} · {best.get('horizon_label', '1 Vela')})",
             )
             return ok
 
@@ -516,7 +712,7 @@ class Engine:
                 self._t["auto_switch"] = now
                 ok, _ = self._switch_symbol(
                     best_sym,
-                    f"Cérebro #1 do Radar ({best['score']:.0f}% · {best.get('horizon_label', '1 Vela')})",
+                    f"Cérebro #1 do Radar ({best['score']:.0f} · {best.get('horizon_label', '1 Vela')})",
                 )
                 return ok
         return False
@@ -566,7 +762,6 @@ class Engine:
         if all_pos is not None:
             if len(all_pos) != len(self.positions):
                 self._t["hist"] = 0.0
-            # Ordena colocando a moeda do gráfico primeiro, depois por horário mais recente
             all_pos.sort(key=lambda p: (0 if p["symbol"] == self.symbol else 1, -int(p.get("time") or 0)))
             self.positions = all_pos
 
@@ -585,11 +780,13 @@ class Engine:
         self.sym = rt_active.info
         self.tick = tick = rt_active.tick
         self.analysis = rt_active.analysis
-        # Exibe no gráfico o timeframe escolhido pelo Cérebro para esta moeda (ou M1 por padrão)
         chart_tf = self.analysis.get("timeframe", "M1") if self.analysis.get("ready") else "M1"
         self.df = rt_active.dfs.get(chart_tf) if rt_active.dfs.get(chart_tf) is not None else rt_active.dfs.get("M1")
-        self.server_day = int(tick["time"]) // 86400
-        self.server_offset_s = int(round((int(tick["time"]) - time.time()) / 900.0) * 900)
+        self.server_time = int(tick["time"])
+        rollover_h = int(settings.get("broker_rollover_hour") or 0)
+        self.server_day = compute_trading_day(self.server_time, rollover_h)
+        self.server_week = compute_trading_week(self.server_time, rollover_h)
+        self.server_offset_s = int(round((self.server_time - time.time()) / 900.0) * 900)
         self._maybe_publish_series(chart_tf)
 
         # 3. Atualiza histórico real de trades
@@ -602,7 +799,7 @@ class Engine:
 
         if now - self._t["hist"] >= 1.5 or not self.history_json:
             self._t["hist"] = now
-            all_deals = self.bridge.deals_between(0, int(tick["time"]) + 86400)
+            all_deals = self.bridge.deals_between(0, self.server_time + 86400)
             if all_deals:
                 for d in all_deals:
                     tkt = int(d.get("ticket") or 0)
@@ -613,31 +810,42 @@ class Engine:
                     self._deals_map.values(),
                     key=lambda d: (int(d.get("time_msc") or 0), int(d.get("time") or 0), int(d.get("ticket") or 0)),
                 )
-                day_start = self.server_day * 86400
+                day_start = self.server_day * 86400 + rollover_h * 3600
                 self.deals = [d for d in self.all_deals if int(d.get("time") or 0) >= day_start]
-                self._publish_history(int(tick["time"]))
+                self._publish_history(self.server_time)
 
-        realized = (
-            max(realized_today(self.deals), float(self.trade_summary.get("net_today") or 0.0))
-            if realized_today(self.deals) == 0.0 and self.trade_summary.get("net_today")
-            else realized_today(self.deals)
+        # 4. Contabilidade separada Trader IA vs Conta Inteira + Rollover de sessão/semana (Partes 2.1 e 2.2)
+        magic = int(settings["magic"])
+        self.day = compute_financial_breakdown(
+            all_deals=self.all_deals,
+            open_positions=self.positions,
+            account=self.account,
+            settings=settings,
+            magic=magic,
+            server_time=self.server_time,
+            trade_summary=self.trade_summary,
         )
-        floating = float(self.account.get("profit") or 0.0)
-        net_all = float(self.trade_summary.get("net_total") or 0.0)
-        self.day = {
-            "realized": realized,
-            "floating": floating,
-            "total": realized + floating,
-            "all_time": net_all + floating,
-            "net_closed": net_all,
-            "trades_total": int(self.trade_summary.get("total_trades") or 0),
-            "trades_wins": int(self.trade_summary.get("wins") or 0),
-        }
+        rollover_res = self.store.sync_session_rollover(
+            server_time=self.server_time,
+            current_day_total=float(self.day.get("total") or 0.0),
+            current_week_total=float(self.day.get("weekly_net") or 0.0),
+            current_equity=float(self.day.get("reference_equity") or 0.0),
+        )
+        if rollover_res.get("lock_cleared"):
+            self.logs.add("🌅 Nova sessão operacional detectada — trava de sessão anterior liberada.", "info")
+            self._publish_meta()
 
-        # 4. Executa o Scanner Multi-Cérebros em paralelo
-        self._scan_step(mode, settings, int(tick["time"]), open_syms)
+        # Atualiza o relatório quantitativo a cada 10s
+        if now - self._t["quant"] >= 10.0 or not self.quant_summary:
+            self._t["quant"] = now
+            self._refresh_quant_report()
 
-        # 5. Monta o mapa de todos os Cérebros prontos para o MegaBrain decidir e gerenciar
+        self.risk_guard_summary = self._compute_live_risk_guard_summary(mode, settings)
+
+        # 5. Executa o Scanner Multi-Cérebros em paralelo
+        self._scan_step(mode, settings, self.server_time, open_syms)
+
+        # 6. Monta o mapa de todos os Cérebros prontos para o MegaBrain decidir e gerenciar
         symbol_map: dict[str, dict] = {}
         for s_name, rt in self.runtimes.items():
             if rt.info and rt.tick and rt.analysis.get("ready"):
@@ -649,7 +857,7 @@ class Engine:
                     "tf_seconds": TF_SECONDS.get(s_tf, 60),
                 }
 
-        # 6. Passo do MegaBrain (pode gerenciar e disparar em qualquer moeda do symbol_map!)
+        # 7. Passo do MegaBrain
         opened_sym = self.brain.step(
             Ctx(
                 symbol=self.symbol,
@@ -660,8 +868,9 @@ class Engine:
                 account=self.account,
                 terminal=self.terminal,
                 day=self.day,
-                server_time=int(tick["time"]),
+                server_time=self.server_time,
                 server_day=self.server_day,
+                server_week=self.server_week,
                 mode=mode,
                 settings=settings,
                 tf_seconds=TF_SECONDS.get(chart_tf, 60),
@@ -670,9 +879,9 @@ class Engine:
             )
         )
 
-        # Se o MegaBrain acabou de abrir ordem em outra moeda (ou se houver auto-switch), foca nela
         if opened_sym:
             self.positions = self.bridge.positions() or self.positions
+            self._refresh_quant_report()
             if opened_sym != self.symbol and settings.get("auto_select_symbol", True):
                 self._t["auto_switch"] = now
                 self._switch_symbol(opened_sym, f"Mega Brain disparou operação em {opened_sym}")
@@ -707,6 +916,7 @@ class Engine:
         settings = self.store.snapshot()
         self.meta_json = self._dump({
             "type": "meta",
+            "algo_version": ALGO_VERSION,
             "modes": [m.to_public() for m in MODES.values()],
             "settings": settings,
             "symbols": self.symbols,
@@ -746,6 +956,7 @@ class Engine:
         grouped = summarize_trades(self.all_deals, magic, self.server_offset_s)
         self.trade_summary = grouped["summary"]
         self.brain.sync_from_history(grouped["trades"], server_now)
+        self._refresh_quant_report()
         deals = sorted(self.all_deals, key=lambda d: d.get("time_msc") or d["time"], reverse=True)
         self.history_json = self._dump({
             "type": "history",
@@ -792,6 +1003,9 @@ class Engine:
             sl_profit=round(sl_profit, 2) if sl_profit is not None else None,
             progress_pct=progress_pct,
             be_protected=be_protected,
+            sl_confirmed=bool(meta.sl_confirmed) if meta else (sl > 0),
+            mfe_pts=round(meta.max_favorable_pts, 1) if meta else 0.0,
+            mae_pts=round(meta.max_adverse_pts, 1) if meta else 0.0,
         )
 
     def _publish_snapshot(self, mode, chart_tf: str = "M1") -> None:
@@ -849,10 +1063,12 @@ class Engine:
             "bars": indicators.chart_rows(self.df, 2) if self.df is not None else [],
             "analysis": self.analysis,
             "mode": mode.key,
-            "ai": self.brain.public(self.server_day, active_brains_count=len(self.radar)),
+            "ai": self.brain.public(self.server_day, active_brains_count=len(self.radar), server_week=self.server_week),
             "radar": self.radar,
             "positions": positions,
             "day": self.day,
+            "risk_guard": self.risk_guard_summary,
+            "quant": self.quant_summary,
         })
         self.snapshot_ver += 1
 
@@ -872,9 +1088,11 @@ class Engine:
             "bars": [],
             "analysis": {},
             "mode": self.store.get("mode"),
-            "ai": self.brain.public(self.server_day, active_brains_count=0),
+            "ai": self.brain.public(self.server_day, active_brains_count=0, server_week=self.server_week),
             "radar": [],
             "positions": [],
             "day": self.day,
+            "risk_guard": self.risk_guard_summary,
+            "quant": self.quant_summary,
         })
         self.snapshot_ver += 1

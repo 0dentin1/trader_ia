@@ -7,16 +7,18 @@ import {
   ChevronRight,
   Clock,
   Cpu,
+  Database,
   Flame,
   Gauge,
   ListChecks,
+  Play,
   ScrollText,
   ShieldAlert,
   TrendingDown,
   TrendingUp,
   XCircle,
 } from "lucide-react";
-import type { AIState, AIStatus, Analysis, LogEntry, ModeConfig, RadarEntry } from "../types";
+import type { AIState, AIStatus, Analysis, LogEntry, ModeConfig, QuantSummary, RadarEntry } from "../types";
 import type { TerminalApi } from "../hooks/useTerminal";
 import { cx, fmtNum } from "../lib/format";
 
@@ -28,16 +30,17 @@ interface Props {
   radar?: RadarEntry[];
   activeSymbol?: string | null;
   autoSymbol?: boolean;
+  quant?: QuantSummary;
   send?: TerminalApi["send"];
 }
 
 const FLOW_STATES: { key: AIState; label: string; desc: string }[] = [
-  { key: "STUDYING_MARKET", label: "1. Multi-Cérebros", desc: "Escaneando todas as moedas em M1/M2/M5" },
-  { key: "EVALUATING_CONFLUENCE", label: "2. Tempo & Vela", desc: "Calculando certeza e validade da vela" },
-  { key: "EXECUTING_TRADE", label: "3. Tiro Sniper", desc: "Disparando ordem no momento imperdível" },
-  { key: "MANAGING_POSITION", label: "4. Colheita Ativa", desc: "Vigiando validade da vela e lucro" },
+  { key: "STUDYING_MARKET", label: "1. Multi-Cérebros", desc: "Escaneando moedas em M1/M2/M5/M15" },
+  { key: "EVALUATING_CONFLUENCE", label: "2. Confluência", desc: "Validando score heurístico e espaço estrutural" },
+  { key: "EXECUTING_TRADE", label: "3. Execução", desc: "Validando risco independente e confirmando SL/TP" },
+  { key: "MANAGING_POSITION", label: "4. Gestão MFE/MAE", desc: "Break-Even e Trailing Stop configurável" },
   { key: "COOLDOWN", label: "5. Pausa Tática", desc: "Aguardando próxima vela limpa" },
-  { key: "RISK_LOCK", label: "6. Meta/Stop Dia", desc: "Operações encerradas hoje" },
+  { key: "RISK_LOCK", label: "6. Trava Sessão/Semana", desc: "Proteção de capital ativa" },
 ];
 
 const SIMPLE_PILLAR_INFO: Record<number, { title: string; subtitle: string }> = {
@@ -47,23 +50,23 @@ const SIMPLE_PILLAR_INFO: Record<number, { title: string; subtitle: string }> = 
   },
   2: {
     title: "2. Alinhamento Estrito Multi-Timeframe (M1+M5+M15)",
-    subtitle: "Proíbe operar contra a tendência do M5 e exige confluência direcional limpa",
+    subtitle: "Proíbe operar contra tendência HTF; ausência de dados M5/M15 bloqueia entrada",
   },
   3: {
-    title: "3. Espaço Livre até Liquidez / Topo / Fundo",
-    subtitle: "Garante alvo maior que o stop sem bater em resistência ou suporte próximo",
+    title: "3. Espaço Estrutural Objetivo (Suporte / Resistência)",
+    subtitle: "Verifica espaço livre sem presumir 2.20 ATR em toques/rompimentos não confirmados",
   },
   4: {
     title: "4. Fluxo Institucional de Ticks & Agressão",
     subtitle: "Confirma agressão real dos compradores/vendedores neste exato segundo",
   },
   5: {
-    title: "5. Assimetria Positiva (Alvo vs Custo de Spread)",
-    subtitle: "Bloqueia moedas paradas (< 6 pts ATR) ou onde o spread come mais de 16% do alvo",
+    title: "5. Eficiência de Custos & Spread vs Alvo",
+    subtitle: "Bloqueia entrada se spread/custos consumirem mais de 30% do risco planejado",
   },
   6: {
-    title: "6. Força Limpa sem Exaustão (RSI / ADX / VWAP)",
-    subtitle: "Garante espaço para o preço andar sem sobrecompra ou sobrevenda extrema",
+    title: "6. Timing de Entrada & Força Limpa",
+    subtitle: "Garante pullback saudável sem esticamento ou exaustão de momentum",
   },
 };
 
@@ -80,11 +83,11 @@ const REGIME_STYLE: Record<string, string> = {
 const REGIME_FRIENDLY: Record<string, string> = {
   TREND_UP: "📈 Tendência de Alta Forte",
   TREND_DOWN: "📉 Tendência de Baixa Forte",
-  REVERSAL_UP: "🔄 Virada Compradora (Rejeição de Fundo / Pavio)",
-  REVERSAL_DOWN: "🔄 Virada Vendedora (Rejeição de Topo / Pavio)",
-  RANGE: "↔️ Mercado Lateral / Consolidação",
-  HIGH_VOL: "⚡ Explosão de Volatilidade / Rompimento",
-  UNKNOWN: "⏳ Carregando histórico do gráfico…",
+  REVERSAL_UP: "🔄 Reversão de Fundo / Rejeição por Pavio",
+  REVERSAL_DOWN: "🔄 Reversão de Topo / Rejeição por Pavio",
+  RANGE: "↔️ Consolidação / Mercado Lateral",
+  HIGH_VOL: "⚡ Alta Volatilidade / Rompimento",
+  UNKNOWN: "⏳ Carregando histórico multi-timeframe…",
 };
 
 const LOG_STYLE: Record<LogEntry["level"], string> = {
@@ -135,7 +138,7 @@ function StateMachine({ ai }: { ai: AIStatus | undefined }) {
       >
         <div className="flex items-center justify-between gap-2">
           <span className="font-bold text-accent">
-            {off ? "⏸️ Mega Brain Pausado (Modo Leitura)" : `🧠 ${ai?.state_label}`}
+            {off ? "⏸️ Mega Brain Quant Pausado (Somente Leitura)" : `🧠 ${ai?.state_label}`}
           </span>
         </div>
         <div className="mt-0.5 truncate text-[11px] text-slate-300">{ai?.detail || "—"}</div>
@@ -145,7 +148,7 @@ function StateMachine({ ai }: { ai: AIStatus | undefined }) {
         <div className="flex items-center gap-1.5 rounded border border-amber-400/50 bg-amber-400/10 px-2.5 py-1.5 text-[10.5px] text-amber-300">
           <ShieldAlert size={13} className="shrink-0" />
           <span>
-            <b>Modo Recuperação Sniper Ativo:</b> exige +2% de certeza, bloqueia repetição de erro e colhe lucro rápido!
+            <b>Defesa Anti-Teimosia Ativa:</b> exige +2 pontos de score e bloqueia repetição no mesmo par.
           </span>
         </div>
       )}
@@ -154,7 +157,7 @@ function StateMachine({ ai }: { ai: AIStatus | undefined }) {
 }
 
 function Thermometer({ a, mode, ai }: { a: Analysis; mode: ModeConfig | undefined; ai: AIStatus | undefined }) {
-  const baseMin = Math.max(82, mode?.min_score ?? 85);
+  const baseMin = Math.max(82, mode?.min_score ?? 86);
   const min = ai?.recovery?.active ? Math.min(91, baseMin + 2) : baseMin;
   const score = a.score ?? 0;
   const hit = score >= min;
@@ -163,21 +166,22 @@ function Thermometer({ a, mode, ai }: { a: Analysis; mode: ModeConfig | undefine
   const allGatesOk = a.gates.every((g) => g.ok);
   const missing = Math.max(0, min - score);
   const hz = a.horizon;
+  const calProb = a.calibrated_win_probability;
 
   return (
     <div className="mx-3 mt-2 rounded border border-ink-700 bg-ink-850 p-2.5">
       <div className="flex items-end justify-between">
         <div>
           <div className="text-[10px] font-bold uppercase tracking-wider text-slate-400">
-            Certeza Sniper desta Moeda · Melhor Lado:
+            Confluência Heurística · Sinal Atual:
           </div>
           <div className={cx("text-xs font-extrabold", a.direction === "BUY" ? "text-bull" : "text-bear")}>{dir}</div>
         </div>
         <div className="text-right">
           <div className={cx("num text-xl font-extrabold leading-none", hit ? "text-bull" : "text-white")}>
-            {score.toFixed(0)}%
+            {score.toFixed(0)}
           </div>
-          <div className="text-[10px] text-slate-400">Sniper ≥ {min}%</div>
+          <div className="text-[10px] text-slate-400">Score Confluência ≥ {min}</div>
         </div>
       </div>
 
@@ -192,30 +196,41 @@ function Thermometer({ a, mode, ai }: { a: Analysis; mode: ModeConfig | undefine
         <div
           className="absolute top-0 h-full w-0.5 bg-white"
           style={{ left: `${min}%` }}
-          title={`Certeza Sniper exigida: ${min}%`}
+          title={`Score mínimo exigido: ${min}`}
         />
       </div>
 
-      <div className="num mt-1 flex justify-between text-[10px] text-slate-400">
+      <div className="num mt-1.5 flex flex-wrap items-center justify-between gap-1 text-[10px] text-slate-400">
         <span>
-          Compra: <b className="text-bull">{fmtNum(a.score_buy, 0)}%</b> · Venda:{" "}
-          <b className="text-bear">{fmtNum(a.score_sell, 0)}%</b>
+          Compra: <b className="text-bull">{fmtNum(a.score_buy, 0)}</b> · Venda:{" "}
+          <b className="text-bear">{fmtNum(a.score_sell, 0)}</b>
         </span>
-        <span>Horizonte: <b className="text-amber-300">{hz?.short_label ?? "⚡ 1 Vela (60s)"}</b></span>
+        <div className="flex items-center gap-1.5">
+          {calProb !== null && calProb !== undefined ? (
+            <span className="rounded bg-sky-500/20 px-1.5 py-0.5 font-bold text-sky-300">
+              Prob. Calibrada: {(calProb * 100).toFixed(0)}%
+            </span>
+          ) : (
+            <span className="rounded bg-ink-800 px-1.5 py-0.5 text-slate-400">
+              Heurístico (Sem Calibração OOS)
+            </span>
+          )}
+          <span>Horizonte: <b className="text-amber-300">{hz?.short_label ?? "⚡ 1 Vela"}</b></span>
+        </div>
       </div>
 
       <div className="mt-1.5 rounded bg-ink-900 px-2 py-1 text-[11px]">
         {a.signal && hit ? (
           <span className="font-bold text-bull">
-            ⚡ OPORTUNIDADE IMPERDÍVEL DE {a.signal === "BUY" ? "COMPRA" : "VENDA"}! ({hz?.label ?? "1 Vela"})
+            ⚡ SINAL SNIPER CONFIRMADO DE {a.signal === "BUY" ? "COMPRA" : "VENDA"}! ({hz?.label ?? "1 Vela"})
           </span>
         ) : !hit ? (
           <span className="text-slate-300">
-            ⏳ Faltam <b className="num text-white">{missing.toFixed(0)}%</b> para ser Imperdível nesta moeda (demais cérebros escaneando em paralelo).
+            ⏳ Faltam <b className="num text-white">{missing.toFixed(0)} pts</b> para acionar Sniper nesta moeda.
           </span>
         ) : !allGatesOk ? (
           <span className="text-amber-300">
-            ⚠️ Nota atingida ({score.toFixed(0)}%), aguardando liberação de espaço livre/vela abaixo.
+            ⚠️ Pontuação atingida ({score.toFixed(0)}), aguardando espaço estrutural livre.
           </span>
         ) : null}
       </div>
@@ -226,6 +241,7 @@ function Thermometer({ a, mode, ai }: { a: Analysis; mode: ModeConfig | undefine
 function CandleAndHorizonBox({ a }: { a: Analysis }) {
   const cdl = a.candle;
   const hz = a.horizon;
+  const sr = a.structural_room;
   if (!cdl) return null;
   const up = cdl.prob_up >= cdl.prob_down;
   const bestProb = up ? cdl.prob_up : cdl.prob_down;
@@ -233,7 +249,7 @@ function CandleAndHorizonBox({ a }: { a: Analysis }) {
     <div className="mx-3 mt-2 rounded border border-ink-700 bg-ink-900/90 p-2.5 text-[11px]">
       <div className="flex flex-wrap items-center justify-between gap-1.5 border-b border-ink-800 pb-1.5">
         <span className="flex items-center gap-1 font-extrabold uppercase tracking-wider text-accent">
-          <Flame size={12} /> Vela & Tempo da Previsão
+          <Flame size={12} /> Estrutura & Horizonte Temporal
         </span>
         <div className="flex items-center gap-1.5">
           {hz && (
@@ -247,7 +263,7 @@ function CandleAndHorizonBox({ a }: { a: Analysis }) {
               up ? "bg-bull/20 text-bull" : "bg-bear/20 text-bear",
             )}
           >
-            Próx. Vela: {bestProb.toFixed(0)}% {up ? "ALTA ↑" : "BAIXA ↓"}
+            Viés Vela: {bestProb.toFixed(0)}% {up ? "ALTA ↑" : "BAIXA ↓"}
           </span>
         </div>
       </div>
@@ -255,15 +271,16 @@ function CandleAndHorizonBox({ a }: { a: Analysis }) {
       <div className="mt-1.5 space-y-1 text-[10.5px] leading-snug">
         {(hz?.strategy || cdl.best_strategy) && (
           <div>
-            <span className="font-semibold text-accent">Estratégia Institucional: </span>
+            <span className="font-semibold text-accent">Estratégia: </span>
             <span className="font-bold text-white">{hz?.strategy ?? cdl.best_strategy}</span>
           </div>
         )}
-        {hz && (
+        {sr && (
           <div>
-            <span className="font-semibold text-amber-300">Tempo Escolhido pela IA: </span>
-            <span className="font-bold text-white">{hz.label}</span>{" "}
-            <span className="text-slate-400">({hz.reason})</span>
+            <span className="font-semibold text-slate-400">Espaço Estrutural: </span>
+            <span className={cx("font-bold", sr.status === "ADEQUATE" ? "text-bull" : sr.status === "TIGHT" ? "text-amber-300" : "text-bear")}>
+              {sr.status} ({sr.room_atr.toFixed(2)} ATR até {sr.level_type})
+            </span>
           </div>
         )}
         <div>
@@ -271,11 +288,7 @@ function CandleAndHorizonBox({ a }: { a: Analysis }) {
           <span className="text-slate-200">{cdl.prev_desc}</span>
         </div>
         <div>
-          <span className="font-semibold text-slate-400">Vela atual: </span>
-          <span className="text-slate-200">{cdl.curr_desc}</span>
-        </div>
-        <div>
-          <span className="font-semibold text-slate-400">Rabos (Pavios): </span>
+          <span className="font-semibold text-slate-400">Rabos / Pavios: </span>
           <span
             className={cx(
               cdl.wick_pressure >= 0.14
@@ -345,9 +358,11 @@ function BrainPanelImpl({
   radar = [],
   activeSymbol,
   autoSymbol = true,
+  quant,
   send,
 }: Props) {
-  const [subTab, setSubTab] = useState<"radar" | "criteria" | "logs">("radar");
+  const [subTab, setSubTab] = useState<"radar" | "criteria" | "quant" | "logs">("radar");
+  const [runningBacktest, setRunningBacktest] = useState(false);
   const logRef = useRef<HTMLDivElement>(null);
   const [follow, setFollow] = useState(true);
 
@@ -365,10 +380,22 @@ function BrainPanelImpl({
   const okCount = a?.pillars?.filter((p) => p.ok).length ?? 0;
   const lastLog = logs.length > 0 ? logs[logs.length - 1] : null;
 
+  const runBacktest = async () => {
+    if (!send) return;
+    setRunningBacktest(true);
+    try {
+      await send("run_backtest", {});
+    } finally {
+      setRunningBacktest(false);
+    }
+  };
+
+  const perf = quant?.performance;
+
   return (
     <aside className="panel flex w-full flex-col overflow-hidden">
       <div className="panel-title">
-        <Brain size={13} className="text-accent" /> Mega Brain V4 · 1 Cérebro por Moeda
+        <Brain size={13} className="text-accent" /> Mega Brain V5 Quant · Multi-Cérebros
         <span
           className={cx(
             "ml-auto rounded px-2 py-0.5 text-[9.5px] font-extrabold",
@@ -399,7 +426,7 @@ function BrainPanelImpl({
           <Thermometer a={a} mode={mode} ai={ai} />
           <CandleAndHorizonBox a={a} />
 
-          {/* CABO DE GUERRA COMPRADORES VS VENDEDORES */}
+          {/* FLUXO DE COMPRADORES VS VENDEDORES */}
           {flow && (
             <div className="px-3 pt-2">
               <div className="mb-1 flex justify-between text-[10px] font-bold uppercase tracking-wider text-slate-400">
@@ -412,40 +439,51 @@ function BrainPanelImpl({
             </div>
           )}
 
-          {/* SELETOR INTERNO: CÉREBROS POR MOEDA vs 6 PILARES vs DIÁRIO */}
-          <div className="mt-2.5 flex items-center gap-1 border-y border-ink-700 bg-ink-850 px-2.5 py-1.5 text-[10.5px]">
+          {/* SELETOR INTERNO: CÉREBROS vs 6 PILARES vs MEMÓRIA QUANT vs DIÁRIO */}
+          <div className="mt-2.5 flex items-center gap-1 border-y border-ink-700 bg-ink-850 px-2.5 py-1.5 text-[10px]">
             <button
               onClick={() => setSubTab("radar")}
               className={cx(
-                "flex flex-1 items-center justify-center gap-1 rounded px-2 py-1 font-extrabold transition",
+                "flex flex-1 items-center justify-center gap-1 rounded px-1.5 py-1 font-extrabold transition",
                 subTab === "radar"
                   ? "bg-accent text-white shadow"
                   : "bg-ink-800 text-slate-300 hover:bg-ink-700 hover:text-white",
               )}
             >
-              <Cpu size={12} /> Cérebros ({radar.length})
+              <Cpu size={11} /> Cérebros ({radar.length})
             </button>
             <button
               onClick={() => setSubTab("criteria")}
               className={cx(
-                "flex flex-1 items-center justify-center gap-1 rounded px-2 py-1 font-extrabold transition",
+                "flex flex-1 items-center justify-center gap-1 rounded px-1.5 py-1 font-extrabold transition",
                 subTab === "criteria"
                   ? "bg-accent text-white shadow"
                   : "bg-ink-800 text-slate-300 hover:bg-ink-700 hover:text-white",
               )}
             >
-              <Gauge size={12} /> 6 Pilares ({okCount}/{totalPillars})
+              <Gauge size={11} /> Pilares ({okCount}/{totalPillars})
+            </button>
+            <button
+              onClick={() => setSubTab("quant")}
+              className={cx(
+                "flex flex-1 items-center justify-center gap-1 rounded px-1.5 py-1 font-extrabold transition",
+                subTab === "quant"
+                  ? "bg-accent text-white shadow"
+                  : "bg-ink-800 text-slate-300 hover:bg-ink-700 hover:text-white",
+              )}
+            >
+              <Database size={11} /> Memória ({perf?.sample_size ?? 0})
             </button>
             <button
               onClick={() => setSubTab("logs")}
               className={cx(
-                "flex flex-1 items-center justify-center gap-1 rounded px-2 py-1 font-extrabold transition",
+                "flex flex-1 items-center justify-center gap-1 rounded px-1.5 py-1 font-extrabold transition",
                 subTab === "logs"
                   ? "bg-accent text-white shadow"
                   : "bg-ink-800 text-slate-300 hover:bg-ink-700 hover:text-white",
               )}
             >
-              <ScrollText size={12} /> Diário ({logs.length})
+              <ScrollText size={11} /> Diário ({logs.length})
             </button>
           </div>
 
@@ -454,10 +492,10 @@ function BrainPanelImpl({
               <div className="flex items-center justify-between text-[10px] text-slate-400">
                 <span>
                   {autoSymbol
-                    ? "🧠 1 Cérebro por moeda (opera até 4 simultâneas c/ trava cambial):"
-                    : "📌 Gráfico fixo (clique em AUTO no topo p/ liberar todos):"}
+                    ? "🧠 1 Cérebro por moeda (até 4 simultâneas com trava USD):"
+                    : "📌 Gráfico fixo (clique em AUTO no topo p/ escanear todas):"}
                 </span>
-                <span>Sniper ≥ {Math.max(85, mode?.min_score ?? 86)}%</span>
+                <span>Sniper ≥ {Math.max(85, mode?.min_score ?? 86)}</span>
               </div>
 
               <div className="max-h-[260px] space-y-1 overflow-y-auto pr-0.5">
@@ -494,7 +532,7 @@ function BrainPanelImpl({
                           )}
                           {r.signal && (
                             <span className="rounded bg-bull px-1.5 py-0.5 text-[9px] font-extrabold text-ink-950">
-                              ⚡ IMPERDÍVEL
+                              ⚡ SINAL
                             </span>
                           )}
                           <span
@@ -519,7 +557,7 @@ function BrainPanelImpl({
                             r.score >= r.min_score && !r.blocked ? "text-bull" : "text-slate-100",
                           )}
                         >
-                          {r.score.toFixed(0)}%
+                          {r.score.toFixed(0)}
                         </div>
                         <div className="mt-0.5 text-[9.5px] text-slate-400">
                           Vela: <b className={isBuy ? "text-bull" : "text-bear"}>{r.next_prob.toFixed(0)}%</b>
@@ -540,7 +578,7 @@ function BrainPanelImpl({
 
               <div>
                 <div className="mb-1 flex items-center gap-1 text-[10px] font-bold uppercase tracking-wider text-slate-400">
-                  <ListChecks size={11} /> Travas Eliminatórias do Mega Brain
+                  <ListChecks size={11} /> Travas Eliminatórias
                 </div>
                 <ul className="space-y-1 rounded border border-ink-700 bg-ink-850 p-2">
                   {a.gates.map((g) => (
@@ -554,6 +592,66 @@ function BrainPanelImpl({
                     </li>
                   ))}
                 </ul>
+              </div>
+            </div>
+          ) : subTab === "quant" ? (
+            <div className="space-y-2 p-2.5 text-[10.5px]">
+              {/* ESTATISTICAS DE MEMORIA SQLITE */}
+              <div className="rounded border border-ink-700 bg-ink-850 p-2">
+                <div className="flex items-center justify-between border-b border-ink-700 pb-1 font-bold text-accent">
+                  <span>Memória Quantitativa (SQLite WAL)</span>
+                  <span className="rounded bg-ink-700 px-1.5 py-0.5 text-[9px] text-slate-200">
+                    Modo: {ai?.adaptive_mode ?? "OBSERVATION"}
+                  </span>
+                </div>
+                <div className="num mt-1.5 grid grid-cols-2 gap-1.5 text-[10px]">
+                  <div>
+                    <span className="text-slate-400">Amostra Registrada: </span>
+                    <b className="text-white">{perf?.sample_size ?? 0} op.</b>
+                  </div>
+                  <div>
+                    <span className="text-slate-400">Acerto Real: </span>
+                    <b className="text-white">{perf?.win_rate?.toFixed(1) ?? 0.0}%</b>
+                  </div>
+                  <div>
+                    <span className="text-slate-400">Expectativa Líquida: </span>
+                    <b className={cx((perf?.expectancy ?? 0) >= 0 ? "text-bull" : "text-bear")}>
+                      {perf?.expectancy !== undefined ? `${perf.expectancy > 0 ? "+" : ""}${perf.expectancy.toFixed(2)}` : "—"}
+                    </b>
+                  </div>
+                  <div>
+                    <span className="text-slate-400">Fator de Lucro: </span>
+                    <b className="text-white">{perf?.profit_factor?.toFixed(2) ?? "—"}</b>
+                  </div>
+                  <div>
+                    <span className="text-slate-400">MFE Médio: </span>
+                    <b className="text-bull">+{perf?.avg_mfe_points?.toFixed(1) ?? 0} pts</b>
+                  </div>
+                  <div>
+                    <span className="text-slate-400">MAE Médio: </span>
+                    <b className="text-bear">-{perf?.avg_mae_points?.toFixed(1) ?? 0} pts</b>
+                  </div>
+                </div>
+              </div>
+
+              {/* BOTÃO E RESULTADO DE BACKTEST WALK-FORWARD */}
+              <div className="rounded border border-ink-700 bg-ink-850 p-2">
+                <div className="flex items-center justify-between">
+                  <span className="font-bold text-slate-200">Validação Walk-Forward OOS</span>
+                  <button
+                    onClick={() => void runBacktest()}
+                    disabled={runningBacktest}
+                    className="flex items-center gap-1 rounded bg-accent/20 border border-accent/40 px-2 py-0.5 text-[10px] font-bold text-accent hover:bg-accent/30 disabled:opacity-50"
+                  >
+                    <Play size={10} /> {runningBacktest ? "Rodando..." : "Executar"}
+                  </button>
+                </div>
+                {quant?.backtest && (
+                  <div className="mt-1.5 text-[10px] text-slate-300">
+                    <div>Status: <b className="text-amber-300">{quant.backtest.verdict?.status ?? "—"}</b></div>
+                    <div className="mt-0.5 text-slate-400">{quant.backtest.verdict?.summary}</div>
+                  </div>
+                )}
               </div>
             </div>
           ) : (
@@ -582,7 +680,6 @@ function BrainPanelImpl({
         <div className="p-3 text-[11px] text-slate-500">Carregando indicadores do MT5…</div>
       )}
 
-      {/* BARRA DE RODAPÉ SEMPRE VISÍVEL COM A ÚLTIMA AÇÃO DA IA */}
       {lastLog && subTab !== "logs" && (
         <button
           onClick={() => setSubTab("logs")}

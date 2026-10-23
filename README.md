@@ -1,6 +1,42 @@
-# TRADER·IA — Terminal Autônomo de Análise e Execução em Tempo Real (MetaTrader 5)
+# TRADER·IA V5 QUANT — Terminal Autônomo e Sistema Quantitativo Institucional (MetaTrader 5)
 
-Terminal operacional local de baixa latência, integrado nativamente ao **MetaTrader 5 (MT5)** via IPC oficial (`MetaTrader5`), sem tela de login, sem dados simulados (**zero mock data**) e dedicado a **um único ativo por vez** com piloto automático completo (**Full Autopilot**).
+Sistema quantitativo institucional e terminal operacional local de baixa latência, integrado nativamente ao **MetaTrader 5 (MT5)** via IPC oficial (`MetaTrader5`), com gestão matemática de risco de capital, proteção avançada para pequenas bancas (R$ 50 a R$ 1.000 / $50 a $1.000), memória persistente em SQLite WAL, validação walk-forward e execução auditada sem dados simulados na esteira de produção.
+
+---
+
+## Principais Inovações da Versão 5.0.0-Quant
+
+1. **Proteção de Capital e Circuit Breaker Persistente:**
+   - Travas diárias e semanais salvas em disco que sobrevivem a reinicializações e alterações acidentais de configuração.
+   - Separação estrita de P&L: O robô monitora apenas as operações com seu `magic number`, sem fechar posições manuais do operador (a menos que a proteção global de conta seja explicitamente solicitada).
+   - Gatekeeper independente de risco: bloqueio estrito `BLOCKED_MIN_LOT` caso o lote mínimo (0.01) exceda a perda máxima permitida para o saldo atual.
+   - Zero Martingale ou aumento de lote em sequência de perdas.
+
+2. **Guardião de Pequenas Bancas (Small Account Guard):**
+   - 5 estados progressivos de drawdown com histerese matemática: `NORMAL`, `CAUTION`, `REDUCED_EXPOSURE`, `TRADING_LOCKED`, `REVIEW_REQUIRED`.
+   - Cálculo da assimetria geométrica de recuperação: `Ganho Necessário = (1 / (1 - Drawdown)) - 1`.
+   - Validação exaustiva para capitais de R$ 50, R$ 100, R$ 500, R$ 1.000 e equivalentes em USD/EUR.
+
+3. **Reconciliação e Execução Blindada com SL/TP Confirmado:**
+   - Protocolo de confirmação de SL/TP direto na corretora MT5. Se não confirmado em 5 segundos, dispara protocolo de fechamento emergencial (`EMERGENCY_CLOSE`).
+   - Reconciliação multifatorial de tickets de ordem, deal e posição, com rastreamento real de derrapagem (*slippage*) e custos.
+
+4. **Confluência Analítica e Estrutural:**
+   - Exigência estrita de múltiplos tempos gráficos: contexto M5/M15 obrigatório para entradas em M1 (`NO_TRADE` se HTF indisponível).
+   - Espaço estrutural objetivo calculado a partir de suportes, resistências e pivôs (sem assumir multiplicadores cegos).
+   - Classificação determinística de regimes de mercado (Tendência de Alta/Baixa, Lateralidade Estreita/Ampla, Alta Volatilidade/Rompimento).
+
+5. **Memória Quantitativa Persistente (`quant_memory.db` WAL):**
+   - Rastreamento prospectivo de MFE (*Maximum Favorable Excursion*) e MAE (*Maximum Adverse Excursion*) tick a tick.
+   - Registro de avaliações de sinais, decisões de veto, eventos de ciclo de vida (Break-Even, Trailing Stop) e análise contrafactual de sinais bloqueados.
+   - Calibração de probabilidade empírica via Brier Score e Log Loss.
+
+6. **Adaptação Estatística Controlada:**
+   - 3 modos de transição: `OBSERVATION`, `SHADOW` e `ACTIVE` (com requisito de amostra mínima $n \ge 20$ e erro padrão para evitar *overfitting*).
+
+7. **Laboratório de Backtesting Walk-Forward:**
+   - Divisão cronológica estrita em 3 conjuntos: Desenvolvimento (50%), Validação (25%) e Teste Fora da Amostra (25%), com janela de purga (*purge gap*) de 15 barras.
+   - Resolução conservadora de ambiguidade intrabarra: sempre assume que o Stop Loss foi atingido primeiro caso ambos SL e TP estejam dentro da mesma vela.
 
 ---
 
@@ -11,38 +47,69 @@ trader_ia/
 ├── backend/
 │   ├── requirements.txt          # Dependências Python
 │   ├── run.py                    # Ponto de entrada Uvicorn/FastAPI (ws://127.0.0.1:8000/ws)
+│   ├── tests/                    # Suíte completa de testes automatizados pytest
+│   │   ├── test_risk_and_capital.py
+│   │   ├── test_small_account_guard.py
+│   │   ├── test_execution_and_bridge.py
+│   │   ├── test_analytical_brain.py
+│   │   ├── test_memory_and_performance.py
+│   │   └── test_adaptation_and_backtest.py
 │   └── app/
-│       ├── config.py             # Modos operacionais (Leve, Mediano, Arriscado) e constantes
-│       ├── mt5_bridge.py         # Conector IPC nativo MetaTrader5 (conta, ticks, velas, ordens, SL/TP)
-│       ├── indicators.py         # Indicadores vetorizados (VWAP Diária ±1σ/±2σ, EMAs 9/21/200, RSI, Estocástico, ADX, ATR, RVOL)
-│       ├── flow.py               # Tape reading quantitativo (agressão de ticks e velocidade)
-│       ├── analysis.py           # Diagnóstico de regime + 5 Pilares + Travas por modo
-│       ├── risk.py               # Cálculo de lote por risco %, SL/TP em ATR e P&L diário real
-│       ├── brain.py              # Máquina de estados autônoma (5 estados + Break-Even + Trailing Stop)
-│       ├── engine.py             # Loop de 100ms dedicado à thread IPC do MT5 e limpeza de buffers na troca de ativo
-│       ├── settings_store.py     # Persistência local das travas e parâmetros
-│       ├── server.py             # Servidor FastAPI + WebSocket bidirecional (100ms)
-│       └── utils.py              # Serialização JSON segura e LogBook em tempo real
+│       ├── config.py             # Configurações V5, constantes e perfis de conta
+│       ├── mt5_bridge.py         # Conector IPC MetaTrader 5 com stub compatível macOS/Linux
+│       ├── small_account_guard.py# Guardião de 5 estados de drawdown e limites de pequena banca
+│       ├── indicators.py         # Indicadores vetorizados (VWAP, EMAs, RSI, ADX, ATR, RVOL)
+│       ├── flow.py               # Tape reading quantitativo de agressão
+│       ├── analysis.py           # Confluência multi-tempo, regimes e espaço estrutural
+│       ├── risk.py               # Gatekeeper independente de risco, lote e correlação
+│       ├── brain.py              # Máquina de estados autônoma e protocolo de execução
+│       ├── engine.py             # Loop assíncrono de 100ms e despacho de ordens
+│       ├── settings_store.py     # Armazenamento seguro e travas persistentes
+│       ├── trade_journal.py      # Banco SQLite WAL da memória quantitativa
+│       ├── performance.py        # Métricas estatísticas, Brier Score e calibração
+│       ├── adaptive_rules.py     # Modos Observation, Shadow e Active
+│       ├── backtest.py           # Laboratório Walk-Forward sem look-ahead bias
+│       ├── server.py             # Servidor FastAPI + WebSocket de baixa latência
+│       └── utils.py              # Utilitários e serialização JSON segura
 ├── frontend/
-│   ├── package.json              # React 18 + TypeScript + TailwindCSS + lightweight-charts + Lucide
+│   ├── package.json              # React 18 + TypeScript + TailwindCSS + lightweight-charts
 │   └── src/
-│       ├── App.tsx               # Layout principal Dark Mode institucional (sem login)
-│       ├── types.ts              # Contratos TypeScript do protocolo WebSocket
-│       ├── hooks/useTerminal.ts  # Cliente WebSocket bidirecional com reconexão automática
-│       ├── lib/format.ts         # Formatação numérica e monetária
-│       └── components/
-│           ├── Header.tsx            # Status MT5, seletor de ativo único, Saldo/Equity/Dia, Autopilot e Panic Close
-│           ├── ModeSelector.tsx      # 3 Cards interativos (Leve, Mediano, Arriscado)
-│           ├── RiskPanel.tsx         # Circuit Breakers (Stop Diário, Gain Diário, Spread Máximo, Risco %)
-│           ├── PriceChart.tsx        # Gráfico TradingView lightweight-charts 60fps + VWAP + EMAs + linhas Entrada/SL/TP
-│           ├── BrainPanel.tsx        # Máquina de estados, Regime, Termômetro 0-100%, 5 Pilares e Log da IA
-│           ├── BottomPanel.tsx       # Posições Abertas tick a tick + Histórico Real do Dia (MT5)
-│           └── ConnectionOverlay.tsx # Bloqueio total da UI quando MT5/Backend desconectado exibindo mt5.last_error()
-├── mql5/
-│   └── TraderIA_SymbolSync.mq5   # EA auxiliar opcional para detectar automaticamente a aba/gráfico em foco no MT5
-├── start_windows.bat             # Inicialização rápida em 1 clique no Windows
-└── start.sh                      # Inicialização rápida para macOS/Linux (frontend local + backend Windows/VM/Wine)
+│       ├── App.tsx               # Terminal Dark Mode com abas de Terminal, Risco e Quant
+│       ├── types.ts              # Contratos TypeScript completos da Versão 5
+│       └── components/           # Componentes operacionais e quantitativos
+├── start_windows.bat             # Inicialização rápida no Windows
+└── start.sh                      # Inicialização rápida no macOS/Linux
 ```
+
+---
+
+## Execução dos Testes Automatizados
+
+Para executar toda a suíte de testes unitários e de integração:
+
+```bash
+cd backend
+./.venv/bin/pytest tests/ -v
+```
+
+Todos os 21 testes cobrem os pilares fundamentais da evolução quantitativa com 100% de sucesso.
+
+---
+
+## Compilação do Frontend
+
+```bash
+cd frontend
+npm install
+npm run build
+```
+
+---
+
+## Inicialização do Sistema
+
+- **Windows:** Duplo clique em `start_windows.bat`.
+- **macOS / Linux:** Execute `./start.sh` (com `BACKEND_WS` configurado para a máquina Windows executando o MT5).
 
 ---
 

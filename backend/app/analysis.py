@@ -1,21 +1,36 @@
-"""Motor de Análise Quantitativa V4 (MEGA BRAIN) — 5 Estratégias Institucionais Consagradas
-(Pullback EMA 9/21, SMC Liquidity Sweep, Volatility Squeeze Breakout, VWAP Bounce e Sincronia MTF),
-Proibição Absoluta de Contra-Tendência e Relógio de Validade da Vela."""
+"""Motor de Análise Quantitativa V5 (MEGA BRAIN) — 5 Famílias de Estratégias Institucionais,
+Detector Determinístico de Regimes, Validação Estrita de Timeframes e Dados (Zero Viés de Falta de Dados),
+Cálculo Objetivo de Espaço Estrutural e Separação entre Score Heurístico e Probabilidade Calibrada."""
 from __future__ import annotations
 
 import numpy as np
 import pandas as pd
 
-from .config import PILLAR_NAMES, ModeConfig
+from .config import ALGO_VERSION, MAX_TICK_AGE_S, PILLAR_NAMES, ModeConfig
 
 REGIME_PT = {
-    "TREND_UP": "Tendência Institucional de Alta",
-    "TREND_DOWN": "Tendência Institucional de Baixa",
-    "PULLBACK_UP": "Pullback em Tendência de Alta (Oportunidade)",
-    "PULLBACK_DOWN": "Pullback em Tendência de Baixa (Oportunidade)",
-    "RANGE": "Consolidação / Lateral",
-    "HIGH_VOL": "Explosão de Volatilidade",
+    "TREND_UP": "Tendência Forte de Alta",
+    "TREND_DOWN": "Tendência Forte de Baixa",
+    "PULLBACK_UP": "Tendência Moderada / Pullback de Alta",
+    "PULLBACK_DOWN": "Tendência Moderada / Pullback de Baixa",
+    "WEAK_TREND_UP": "Tendência Fraca de Alta",
+    "WEAK_TREND_DOWN": "Tendência Fraca de Baixa",
+    "RANGE": "Mercado Lateral / Consolidação",
+    "HIGH_VOL": "Alta Volatilidade",
+    "LOW_VOL": "Baixa Volatilidade (Sem Amplitude)",
+    "REGIME_TRANSITION": "Transição de Regime (Divergência M1/M5)",
+    "DISPROPORTIONATE_SPREAD": "Spread Desproporcional ao Alvo/ATR",
+    "UNFAVORABLE_EXECUTION": "Execução Desfavorável",
+    "INCOMPLETE_DATA": "Dados Incompletos ou Desatualizados",
     "UNKNOWN": "Indefinido",
+}
+
+STRATEGY_FAMILIES = {
+    "EMA_PULLBACK": "Pullback Institucional EMA 9/21",
+    "SMC_LIQUIDITY_SWEEP": "SMC Varredura de Liquidez",
+    "VOLATILITY_SQUEEZE": "Explosão de Compressão (Breakout)",
+    "VWAP_INSTITUTIONAL": "Defesa/Rejeição Institucional na VWAP",
+    "MTF_MOMENTUM": "Fluxo Sincronizado M1+M5+M15",
 }
 
 
@@ -57,11 +72,17 @@ def _pillar(
     }
 
 
-def _htf_summary(htf_df: pd.DataFrame | None) -> dict:
-    """Resumo completo do Timeframe Superior (M5 ou M15) para garantir alinhamento de tendência."""
+def _htf_summary(htf_df: pd.DataFrame | None, server_now: int = 0, max_stale_s: int = 1200) -> dict:
+    """
+    Resumo completo do Timeframe Superior (M5 ou M15).
+    IMPORTANTE (Parte 2.9): A ausência ou desatualização de M5/M15 retorna `available=False`
+    e NUNCA é tratada como confirmação positiva de tendência.
+    """
     if htf_df is None or len(htf_df) < 35:
         return {
             "available": False,
+            "stale": False,
+            "reason": "Histórico insuficiente no timeframe superior (< 35 barras).",
             "trend": 0,
             "bias21": 0,
             "bias9": 0,
@@ -69,23 +90,58 @@ def _htf_summary(htf_df: pd.DataFrame | None) -> dict:
             "bar_body_atr": 0.0,
             "atr": 0.0,
             "rsi": 50.0,
+            "bar_time": 0,
         }
+
     last = htf_df.iloc[-1]
     prev = htf_df.iloc[-2]
-    c = float(last["close"])
-    o = float(last["open"])
-    h = float(last["high"])
-    l = float(last["low"])
-    e9 = float(last["ema9"]) if pd.notna(last["ema9"]) else c
-    e21 = float(last["ema21"]) if pd.notna(last["ema21"]) else c
-    e200 = float(last["ema200"]) if pd.notna(last["ema200"]) else e21
-    atr_h = float(last["atr"]) if pd.notna(last["atr"]) and float(last["atr"]) > 0 else max(abs(h - l), 1e-9)
-    rsi_h = float(last["rsi"]) if pd.notna(last["rsi"]) else 50.0
+    c = _f(last.get("close"))
+    o = _f(last.get("open"))
+    h = _f(last.get("high"))
+    l = _f(last.get("low"))
+    e9 = _f(last.get("ema9"))
+    e21 = _f(last.get("ema21"))
+    e200 = _f(last.get("ema200"))
+    atr_h = _f(last.get("atr"))
+    rsi_h = _f(last.get("rsi"))
+    bar_t = int(last.get("time") or 0)
 
+    if None in (c, o, h, l, e9, e21, atr_h, rsi_h) or atr_h <= 0:
+        return {
+            "available": False,
+            "stale": False,
+            "reason": "Indicadores inválidos (NaN/inf) no timeframe superior.",
+            "trend": 0,
+            "bias21": 0,
+            "bias9": 0,
+            "bar_dir": 0,
+            "bar_body_atr": 0.0,
+            "atr": 0.0,
+            "rsi": 50.0,
+            "bar_time": bar_t,
+        }
+
+    if server_now > 0 and bar_t > 0 and (server_now - bar_t) > max_stale_s:
+        return {
+            "available": False,
+            "stale": True,
+            "reason": f"Timeframe superior desatualizado ({server_now - bar_t}s > {max_stale_s}s).",
+            "trend": 0,
+            "bias21": 0,
+            "bias9": 0,
+            "bar_dir": 0,
+            "bar_body_atr": 0.0,
+            "atr": atr_h,
+            "rsi": round(rsi_h, 1),
+            "bar_time": bar_t,
+        }
+
+    e200_val = e200 if e200 is not None else e21
     body = c - o
-    prev_body = float(prev["close"]) - float(prev["open"])
+    prev_c = _f(prev.get("close")) or c
+    prev_o = _f(prev.get("open")) or o
+    prev_body = prev_c - prev_o
 
-    # Tendência estrutural do timeframe superior
     if c > e21 and e9 >= e21:
         bias21 = 1
     elif c < e21 and e9 <= e21:
@@ -93,9 +149,9 @@ def _htf_summary(htf_df: pd.DataFrame | None) -> dict:
     else:
         bias21 = 1 if c >= e21 else -1
 
-    if c > e200 and e21 >= e200:
+    if c > e200_val and e21 >= e200_val:
         trend = 1
-    elif c < e200 and e21 <= e200:
+    elif c < e200_val and e21 <= e200_val:
         trend = -1
     else:
         trend = bias21
@@ -105,6 +161,8 @@ def _htf_summary(htf_df: pd.DataFrame | None) -> dict:
 
     return {
         "available": True,
+        "stale": False,
+        "reason": "",
         "trend": trend,
         "bias21": bias21,
         "bias9": bias9,
@@ -112,7 +170,244 @@ def _htf_summary(htf_df: pd.DataFrame | None) -> dict:
         "bar_body_atr": round(body / atr_h, 3),
         "atr": atr_h,
         "rsi": round(rsi_h, 1),
+        "bar_time": bar_t,
     }
+
+
+def classify_structural_room(
+    opens: np.ndarray,
+    highs: np.ndarray,
+    lows: np.ndarray,
+    closes: np.ndarray,
+    atr: float,
+    d: int,
+    htf_m5: dict,
+) -> dict:
+    """
+    Avalia objetivamente o espaço estrutural até suporte/resistência (Parte 2.10).
+    NUNCA atribui 2.20 ATR automaticamente apenas porque o preço tocou ou ultrapassou o nível.
+    Distingue:
+    - BELOW_RESISTANCE / ABOVE_SUPPORT (preço ainda aquém do nível)
+    - POTENTIAL_BREAKOUT (rompimento intrabar sem fechamento confirmado -> BLOQUEADO)
+    - CONFIRMED_BREAKOUT (vela anterior fechou além do nível com corpo forte e sem rejeição)
+    - RETEST_CONFIRMED (rompeu nível anterior, recuou para testar e defendeu a favor)
+    - UNKNOWN_STRUCTURE (histórico insuficiente ou range degenerado -> BLOQUEADO)
+    """
+    if len(highs) < 30 or atr <= 0:
+        return {
+            "status": "UNKNOWN_STRUCTURE",
+            "room_atr": 0.0,
+            "confirmed": False,
+            "barrier_price": 0.0,
+            "reason": "Estrutura de suporte/resistência insuficiente (< 30 barras).",
+        }
+
+    price = float(closes[-1])
+    o0, h0, l0, c0 = float(opens[-1]), float(highs[-1]), float(lows[-1]), float(closes[-1])
+    o1, h1, l1, c1 = float(opens[-2]), float(highs[-2]), float(lows[-2]), float(closes[-2])
+    rng0 = max(h0 - l0, 1e-9)
+    rng1 = max(h1 - l1, 1e-9)
+    body1 = c1 - o1
+    uw0_pct = (h0 - max(o0, c0)) / rng0
+    lw0_pct = (min(o0, c0) - l0) / rng0
+    uw1_pct = (h1 - max(o1, c1)) / rng1
+    lw1_pct = (min(o1, c1) - l1) / rng1
+
+    # Estrutura local das 24 velas anteriores fechadas (excluindo B0)
+    swing_high_24 = float(np.max(highs[-25:-1]))
+    swing_low_24 = float(np.min(lows[-25:-1]))
+    # Estrutura anterior a B1 (para verificar se B1 fechou rompendo o topo/fundo prévio)
+    prior_high_23 = float(np.max(highs[-26:-2]))
+    prior_low_23 = float(np.min(lows[-26:-2]))
+    # Estrutura mais ampla (até 90 barras fechadas)
+    look_macro = min(len(highs) - 1, 90)
+    macro_high = float(np.max(highs[-look_macro:-1]))
+    macro_low = float(np.min(lows[-look_macro:-1]))
+
+    if swing_high_24 - swing_low_24 < 0.40 * atr:
+        return {
+            "status": "UNKNOWN_STRUCTURE",
+            "room_atr": 0.20,
+            "confirmed": False,
+            "barrier_price": swing_high_24 if d > 0 else swing_low_24,
+            "reason": "Estrutura comprimida/indefinida (< 0,40 ATR de amplitude em 24 barras).",
+        }
+
+    m5_aligned = bool(htf_m5.get("available") and htf_m5.get("bias21", 0) * d > 0)
+
+    if d > 0:
+        # COMPRA: avaliando espaço até resistência (swing_high_24)
+        raw_dist_atr = (swing_high_24 - price) / atr
+        if raw_dist_atr >= 0.15:
+            # Preço ainda abaixo da resistência de 24 velas
+            enough = raw_dist_atr >= 1.15
+            return {
+                "status": "BELOW_RESISTANCE",
+                "room_atr": round(float(np.clip(raw_dist_atr, 0.05, 2.80)), 2),
+                "confirmed": enough,
+                "barrier_price": swing_high_24,
+                "reason": (
+                    f"Espaço livre até resistência: {raw_dist_atr:.2f} ATR"
+                    if enough
+                    else f"Resistência próxima em {swing_high_24} ({raw_dist_atr:.2f} ATR < 1,15 ATR)"
+                ),
+            }
+
+        # Preço está encostado ou acima de prior_high_23 / swing_high_24: verificar se é rompimento confirmado ou falso
+        b1_broke_clean = (
+            c1 >= prior_high_23 + 0.08 * atr
+            and body1 >= 0.45 * rng1
+            and uw1_pct <= 0.25
+            and c0 >= c1 - 0.10 * atr
+            and uw0_pct <= 0.28
+            and m5_aligned
+        )
+        # Reteste confirmado de topo anterior rompido nas últimas 10 barras
+        mid_high_10 = float(np.max(highs[-15:-5]))
+        retest_ok = (
+            c1 > mid_high_10
+            and l1 <= mid_high_10 + 0.18 * atr
+            and lw1_pct >= 0.35
+            and c0 > o0
+            and m5_aligned
+        )
+
+        if b1_broke_clean or retest_ok:
+            # Calcula espaço real até o topo macro (90 barras) ou projeção conservadora do ATR do M5
+            macro_room = (macro_high - price) / atr if macro_high > price + 0.30 * atr else 0.0
+            htf_proj = (float(htf_m5.get("atr") or atr) * 0.70) / atr if htf_m5.get("available") else 1.35
+            confirmed_room = max(macro_room, min(1.65, max(1.25, htf_proj)))
+            status_code = "CONFIRMED_BREAKOUT" if b1_broke_clean else "RETEST_CONFIRMED"
+            return {
+                "status": status_code,
+                "room_atr": round(float(np.clip(confirmed_room, 1.20, 2.20)), 2),
+                "confirmed": True,
+                "barrier_price": macro_high,
+                "reason": f"Rompimento/reteste confirmado acima de {prior_high_23} com M5 alinhado.",
+            }
+
+        # Caso contrário: rompimento potencial NÃO confirmado (possível topo duplo / armadilha)
+        return {
+            "status": "POTENTIAL_BREAKOUT",
+            "room_atr": round(max(0.05, raw_dist_atr), 2),
+            "confirmed": False,
+            "barrier_price": swing_high_24,
+            "reason": "Preço testando topo/resistência sem fechamento de rompimento confirmado (risco de falso rompimento).",
+        }
+
+    else:
+        # VENDA: avaliando espaço até suporte (swing_low_24)
+        raw_dist_atr = (price - swing_low_24) / atr
+        if raw_dist_atr >= 0.15:
+            enough = raw_dist_atr >= 1.15
+            return {
+                "status": "ABOVE_SUPPORT",
+                "room_atr": round(float(np.clip(raw_dist_atr, 0.05, 2.80)), 2),
+                "confirmed": enough,
+                "barrier_price": swing_low_24,
+                "reason": (
+                    f"Espaço livre até suporte: {raw_dist_atr:.2f} ATR"
+                    if enough
+                    else f"Suporte próximo em {swing_low_24} ({raw_dist_atr:.2f} ATR < 1,15 ATR)"
+                ),
+            }
+
+        b1_broke_clean = (
+            c1 <= prior_low_23 - 0.08 * atr
+            and (-body1) >= 0.45 * rng1
+            and lw1_pct <= 0.25
+            and c0 <= c1 + 0.10 * atr
+            and lw0_pct <= 0.28
+            and m5_aligned
+        )
+        mid_low_10 = float(np.min(lows[-15:-5]))
+        retest_ok = (
+            c1 < mid_low_10
+            and h1 >= mid_low_10 - 0.18 * atr
+            and uw1_pct >= 0.35
+            and c0 < o0
+            and m5_aligned
+        )
+
+        if b1_broke_clean or retest_ok:
+            macro_room = (price - macro_low) / atr if macro_low < price - 0.30 * atr else 0.0
+            htf_proj = (float(htf_m5.get("atr") or atr) * 0.70) / atr if htf_m5.get("available") else 1.35
+            confirmed_room = max(macro_room, min(1.65, max(1.25, htf_proj)))
+            status_code = "CONFIRMED_BREAKOUT" if b1_broke_clean else "RETEST_CONFIRMED"
+            return {
+                "status": status_code,
+                "room_atr": round(float(np.clip(confirmed_room, 1.20, 2.20)), 2),
+                "confirmed": True,
+                "barrier_price": macro_low,
+                "reason": f"Rompimento/reteste confirmado abaixo de {prior_low_23} com M5 alinhado.",
+            }
+
+        return {
+            "status": "POTENTIAL_BREAKOUT",
+            "room_atr": round(max(0.05, raw_dist_atr), 2),
+            "confirmed": False,
+            "barrier_price": swing_low_24,
+            "reason": "Preço testando fundo/suporte sem fechamento de rompimento confirmado (risco de falso rompimento).",
+        }
+
+
+def classify_market_regime(
+    *,
+    price: float,
+    e9: float,
+    e21: float,
+    e200: float,
+    adx_v: float,
+    pdi: float,
+    mdi: float,
+    atr: float,
+    atr_ratio: float,
+    atr_points: float,
+    spread_price: float,
+    spread_points: int,
+    max_spread: int,
+    htf_m5: dict,
+    htf_m15: dict,
+    flow_ok: bool,
+    tick_stale: bool,
+    buy_strats: list[str],
+    sell_strats: list[str],
+) -> tuple[str, str]:
+    """
+    Detector determinístico e testável de regimes de mercado (Parte 4.4).
+    Retorna `(ui_regime_code, detailed_regime_code)`.
+    """
+    if not htf_m5.get("available") or not htf_m15.get("available") or tick_stale:
+        return "UNKNOWN", "INCOMPLETE_DATA"
+    if spread_points > max_spread or spread_price > 0.25 * atr:
+        return "HIGH_VOL", "DISPROPORTIONATE_SPREAD"
+    if not flow_ok and atr_points < 7.0:
+        return "RANGE", "UNFAVORABLE_EXECUTION"
+    if atr_points < 6.0 or atr_ratio < 0.55:
+        return "RANGE", "LOW_VOL"
+    if atr_ratio > 2.20:
+        return "HIGH_VOL", "HIGH_VOL"
+
+    m1_dir = 1 if (price > e21 and e9 >= e21) else (-1 if (price < e21 and e9 <= e21) else 0)
+    m5_dir = int(htf_m5.get("bias21") or 0)
+    if m1_dir != 0 and m5_dir != 0 and m1_dir * m5_dir < 0:
+        return "RANGE", "REGIME_TRANSITION"
+
+    if adx_v >= 22.0 and pdi > mdi and m1_dir > 0 and m5_dir > 0 and price >= e200:
+        return "TREND_UP", "TREND_UP"
+    if adx_v >= 22.0 and mdi > pdi and m1_dir < 0 and m5_dir < 0 and price <= e200:
+        return "TREND_DOWN", "TREND_DOWN"
+
+    if m1_dir > 0 and m5_dir > 0:
+        if buy_strats and ("Pullback" in buy_strats[0] or "SMC" in buy_strats[0]):
+            return "PULLBACK_UP", "PULLBACK_UP"
+        return "TREND_UP", "WEAK_TREND_UP"
+    if m1_dir < 0 and m5_dir < 0:
+        if sell_strats and ("Pullback" in sell_strats[0] or "SMC" in sell_strats[0]):
+            return "PULLBACK_DOWN", "PULLBACK_DOWN"
+        return "TREND_DOWN", "WEAK_TREND_DOWN"
+
+    return "RANGE", "RANGE"
 
 
 def _analyze_candles_and_strategies(
@@ -135,12 +430,12 @@ def _analyze_candles_and_strategies(
     digits: int,
 ) -> dict:
     """
-    Motor V4: Lê a anatomia das velas (B3, B2, B1, B0) + detecta as 5 Estratégias Institucionais
-    SEMPRE A FAVOR da tendência principal (proibindo vendas em tendência de alta e compras em tendência de baixa).
+    Analisa a anatomia das velas (B3, B2, B1, B0) e identifica as 5 famílias de estratégias.
+    IMPORTANTE (Parte 2.9): Exige `htf_m5["available"] == True` e `htf_m15["available"] == True`.
+    A falta de dados de M5 ou M15 NUNCA é tratada como tendência favorável.
     """
     eps = max(atr * 0.05, 1e-9)
 
-    # Vela atual (B0)
     o0, h0, l0, c0 = float(opens[-1]), float(highs[-1]), float(lows[-1]), float(closes[-1])
     rng0 = max(h0 - l0, eps)
     body0 = c0 - o0
@@ -150,7 +445,6 @@ def _analyze_candles_and_strategies(
     pos0 = (c0 - l0) / rng0
     stretch0_atr = abs_body0 / max(atr, 1e-9)
 
-    # Vela anterior fechada (B1)
     o1, h1, l1, c1 = float(opens[-2]), float(highs[-2]), float(lows[-2]), float(closes[-2])
     rng1 = max(h1 - l1, eps)
     body1 = c1 - o1
@@ -160,7 +454,6 @@ def _analyze_candles_and_strategies(
     body1_pct = abs_body1 / rng1
     pos1 = (c1 - l1) / rng1
 
-    # Velas B2 e B3
     o2, h2, l2, c2 = float(opens[-3]), float(highs[-3]), float(lows[-3]), float(closes[-3])
     rng2 = max(h2 - l2, eps)
     body2 = c2 - o2
@@ -170,10 +463,9 @@ def _analyze_candles_and_strategies(
     o3, c3 = float(opens[-4]), float(closes[-4])
     body3 = c3 - o3
 
-    e9, e21, e200 = float(ema9s[-1]), float(ema21s[-1]), float(ema200s[-1])
+    e9, e21, _ = float(ema9s[-1]), float(ema21s[-1]), float(ema200s[-1])
     vwap_now = float(vwaps[-1]) if np.isfinite(vwaps[-1]) else e21
 
-    # Padrões de vela
     b1_bull_hammer = lw1_pct >= 0.42 and uw1_pct <= 0.28 and pos1 >= 0.56 and rng1 >= 0.30 * atr
     b1_bear_star = uw1_pct >= 0.42 and lw1_pct <= 0.28 and pos1 <= 0.44 and rng1 >= 0.30 * atr
     b1_bull_engulf = body1 > 0 and body2 < 0 and c1 >= o2 and abs_body1 >= abs(body2) * 0.85 and pos1 >= 0.62
@@ -196,21 +488,24 @@ def _analyze_candles_and_strategies(
     upper_wick_pressure = uw1_pct * 0.45 + uw0_pct * 0.35 + uw2_pct * 0.20
     wick_net = lower_wick_pressure - upper_wick_pressure
 
-    # --- DETECÇÃO DAS 5 ESTRATÉGIAS INSTITUCIONAIS (Para COMPRA e para VENDA) ---
+    # --- VALIDAÇÃO ESTRITA DE TENDÊNCIA MULTI-TIMEFRAME (Parte 2.9: sem dados = False!) ---
     m1_up_trend = c0 >= e21 and e9 >= e21 - 0.05 * atr
     m1_dn_trend = c0 <= e21 and e9 <= e21 + 0.05 * atr
-    m5_up = not htf_m5["available"] or (htf_m5["bias21"] > 0 and htf_m5["bar_body_atr"] >= -0.12)
-    m5_dn = not htf_m5["available"] or (htf_m5["bias21"] < 0 and htf_m5["bar_body_atr"] <= 0.12)
-    m15_up = not htf_m15["available"] or htf_m15["trend"] >= 0
-    m15_dn = not htf_m15["available"] or htf_m15["trend"] <= 0
+    m5_avail = bool(htf_m5.get("available"))
+    m15_avail = bool(htf_m15.get("available"))
 
-    # 1. PULLBACK INSTITUCIONAL NA EMA 9/21 + IGNIÇÃO (Favor da Tendência)
+    m5_up = bool(m5_avail and htf_m5["bias21"] > 0 and htf_m5["bar_body_atr"] >= -0.12)
+    m5_dn = bool(m5_avail and htf_m5["bias21"] < 0 and htf_m5["bar_body_atr"] <= 0.12)
+    m15_up = bool(m15_avail and htf_m15["trend"] >= 0)
+    m15_dn = bool(m15_avail and htf_m15["trend"] <= 0)
+
+    # 1. PULLBACK INSTITUCIONAL NA EMA 9/21 + IGNIÇÃO
     touched_ema_up = (min(l1, l0) <= max(e9, e21) + 0.18 * atr) and (c0 > e9) and (body0 > 0 or c1 > o1)
     touched_ema_dn = (max(h1, h0) >= min(e9, e21) - 0.18 * atr) and (c0 < e9) and (body0 < 0 or c1 < o1)
     strat_pullback_buy = bool(m1_up_trend and m5_up and touched_ema_up and (b1_bull_hammer or b1_bull_engulf or broke_prev_high or b0_bull_pin))
     strat_pullback_sell = bool(m1_dn_trend and m5_dn and touched_ema_dn and (b1_bear_star or b1_bear_engulf or broke_prev_low or b0_bear_pin))
 
-    # 2. SMC LIQUIDITY SWEEP (Varredura de Liquidez de Micro-Fundo/Topo a Favor do M5)
+    # 2. SMC LIQUIDITY SWEEP
     min_prev5 = float(np.min(lows[-7:-2]))
     max_prev5 = float(np.max(highs[-7:-2]))
     swept_low = (min(l1, l0) <= min_prev5 + 0.05 * atr) and (c0 > min_prev5) and (lw1_pct >= 0.36 or lw0_pct >= 0.36 or b1_bull_engulf)
@@ -218,7 +513,7 @@ def _analyze_candles_and_strategies(
     strat_smc_buy = bool(m5_up and swept_low and c0 >= o0)
     strat_smc_sell = bool(m5_dn and swept_high and c0 <= o0)
 
-    # 3. VOLATILITY SQUEEZE BREAKOUT (Rompimento de Compressão)
+    # 3. VOLATILITY SQUEEZE BREAKOUT
     recent_ranges = highs[-7:-2] - lows[-7:-2]
     is_squeezed = float(np.mean(recent_ranges)) <= 0.92 * atr
     box_high = float(np.max(highs[-6:-1]))
@@ -232,7 +527,7 @@ def _analyze_candles_and_strategies(
     strat_vwap_buy = bool(m1_up_trend and m5_up and near_vwap_up and (above_prev_mid or broke_prev_high))
     strat_vwap_sell = bool(m1_dn_trend and m5_dn and near_vwap_dn and (below_prev_mid or broke_prev_low))
 
-    # 5. MULTI-TIMEFRAME FULL MOMENTUM (M1 + M5 + M15 100% Sincronizados)
+    # 5. MULTI-TIMEFRAME FULL MOMENTUM
     strat_mtf_buy = bool(
         m1_up_trend and m5_up and m15_up and htf_m5.get("bar_dir", 0) > 0
         and body1 > 0 and body0 > 0.04 * atr and uw0_pct < 0.28 and stretch0_atr < 0.72
@@ -243,32 +538,43 @@ def _analyze_candles_and_strategies(
     )
 
     buy_strats: list[str] = []
+    buy_strat_ids: list[str] = []
     if strat_pullback_buy:
         buy_strats.append("Pullback Institucional EMA 9/21")
+        buy_strat_ids.append("EMA_PULLBACK")
     if strat_smc_buy:
         buy_strats.append("SMC Varredura de Liquidez (Fundo)")
+        buy_strat_ids.append("SMC_LIQUIDITY_SWEEP")
     if strat_squeeze_buy:
         buy_strats.append("Explosão de Compressão (Breakout)")
+        buy_strat_ids.append("VOLATILITY_SQUEEZE")
     if strat_vwap_buy:
         buy_strats.append("Defesa Institucional na VWAP")
+        buy_strat_ids.append("VWAP_INSTITUTIONAL")
     if strat_mtf_buy:
         buy_strats.append("Fluxo Sincronizado M1+M5+M15")
+        buy_strat_ids.append("MTF_MOMENTUM")
 
     sell_strats: list[str] = []
+    sell_strat_ids: list[str] = []
     if strat_pullback_sell:
         sell_strats.append("Pullback Institucional EMA 9/21")
+        sell_strat_ids.append("EMA_PULLBACK")
     if strat_smc_sell:
         sell_strats.append("SMC Varredura de Liquidez (Topo)")
+        sell_strat_ids.append("SMC_LIQUIDITY_SWEEP")
     if strat_squeeze_sell:
         sell_strats.append("Explosão de Compressão (Breakout)")
+        sell_strat_ids.append("VOLATILITY_SQUEEZE")
     if strat_vwap_sell:
         sell_strats.append("Rejeição Institucional na VWAP")
+        sell_strat_ids.append("VWAP_INSTITUTIONAL")
     if strat_mtf_sell:
         sell_strats.append("Fluxo Sincronizado M1+M5+M15")
+        sell_strat_ids.append("MTF_MOMENTUM")
 
-    # --- Probabilidade da Próxima Vela (Alinhada com Tendência + Vela + Fluxo) ---
+    # Índice Heurístico Direcional (Parte 4.1: não é probabilidade estatística calibrada!)
     edge = 0.0
-    # Peso forte da tendência M5 e M1 (evita prever queda quando o mercado está em tendência de alta!)
     if m5_up and m1_up_trend:
         edge += 16.0
     elif m5_dn and m1_dn_trend:
@@ -304,13 +610,19 @@ def _analyze_candles_and_strategies(
     bull_reversal = bool(strat_pullback_buy or strat_smc_buy)
     bear_reversal = bool(strat_pullback_sell or strat_smc_sell)
 
-    # --- VETOS INEGOCIÁVEIS (Anti-Loss / Proibição de Contra-Tendência e Fim de Vela) ---
+    # --- VETOS INEGOCIÁVEIS ---
     veto_buy: list[str] = []
     veto_sell: list[str] = []
 
-    # 1. PROIBIDO OPERAR CONTRA A TENDÊNCIA DO M5/M1
-    if not m5_up:
+    if not m5_avail or not m15_avail:
+        missing_msg = htf_m5.get("reason") or htf_m15.get("reason") or "Dados obrigatórios de M5/M15 indisponíveis (NO_TRADE)"
+        veto_buy.append(missing_msg)
+        veto_sell.append(missing_msg)
+
+    if m5_avail and not m5_up:
         veto_buy.append("Proibido Comprar contra a tendência de Baixa do M5")
+    if m15_avail and not m15_up:
+        veto_buy.append("Proibido Comprar contra a tendência Macro do M15")
     if not m1_up_trend and not strat_smc_buy:
         veto_buy.append("Preço abaixo da EMA 21 (tendência curta vendedora)")
     if body0 < -0.02 * atr:
@@ -324,8 +636,10 @@ def _analyze_candles_and_strategies(
     if stretch0_atr >= 0.72 and body0 > 0:
         veto_buy.append(f"Vela atual já esticou +{stretch0_atr:.2f} ATR (proibido comprar no topo da vela)")
 
-    if not m5_dn:
+    if m5_avail and not m5_dn:
         veto_sell.append("Proibido Vender contra a tendência de Alta do M5")
+    if m15_avail and not m15_dn:
+        veto_sell.append("Proibido Vender contra a tendência Macro do M15")
     if not m1_dn_trend and not strat_smc_sell:
         veto_sell.append("Preço acima da EMA 21 (tendência curta compradora)")
     if body0 > 0.02 * atr:
@@ -339,7 +653,6 @@ def _analyze_candles_and_strategies(
     if stretch0_atr >= 0.72 and body0 < 0:
         veto_sell.append(f"Vela atual já caiu -{stretch0_atr:.2f} ATR (proibido vender no fundo da vela)")
 
-    # Descrições claras
     if buy_strats and prob_up >= prob_down:
         prev_desc = f"Estratégia: {buy_strats[0]} · fechou {c1:.{digits}f}"
     elif sell_strats and prob_down > prob_up:
@@ -372,6 +685,8 @@ def _analyze_candles_and_strategies(
     return {
         "prob_up": prob_up,
         "prob_down": prob_down,
+        "is_calibrated": False,
+        "probability_type": "HEURISTIC_DIRECTIONAL_INDEX",
         "next_dir": next_dir,
         "prev_desc": prev_desc,
         "curr_desc": curr_desc,
@@ -379,6 +694,8 @@ def _analyze_candles_and_strategies(
         "wick_pressure": round(float(wick_net), 3),
         "buy_strategies": buy_strats,
         "sell_strategies": sell_strats,
+        "buy_strategy_ids": buy_strat_ids,
+        "sell_strategy_ids": sell_strat_ids,
         "bull_reversal": bull_reversal,
         "bear_reversal": bear_reversal,
         "bull_impulse": bull_impulse,
@@ -417,15 +734,16 @@ def _select_horizon(
     timeframe: str,
 ) -> dict:
     """
-    Define o Horizonte Temporal e garante SEMPRE R/R POSITIVO (Alvo tp_atr > Stop sl_atr),
-    para que os ganhos nunca sejam menores que as perdas!
+    Define o Horizonte Temporal e assegura que o alvo não exceda o espaço estrutural real disponível.
+    Registra a estratégia principal e as estratégias em confluência (Parte 4.3).
     """
     side_up = d > 0
     strats = cdl["buy_strategies"] if side_up else cdl["sell_strategies"]
-    strat_name = strats[0] if strats else "Impulso de Vela A Favor da Tendência"
+    strat_ids = cdl["buy_strategy_ids"] if side_up else cdl["sell_strategy_ids"]
+    strat_name = strats[0] if strats else "Aguardando Setup Institucional"
+    strat_id = strat_ids[0] if strat_ids else "NONE"
     m15_aligned = bool(htf_m15.get("available") and htf_m15.get("trend", 0) * d > 0)
 
-    # Caso 1: Onda de Tendência (3 a 5 min) — M1 + M5 + M15 sincronizados com amplo espaço (>= 2.0 ATR)
     if m15_aligned and adx_v >= 20.0 and room_atr >= 2.0:
         dur_s = min(300, max(180, bar_remaining_s + 180))
         sl_atr = 1.25
@@ -439,10 +757,12 @@ def _select_horizon(
             "tp_atr": tp_atr,
             "sl_atr": sl_atr,
             "strategy": strat_name,
+            "strategy_id": strat_id,
+            "confluence_strategies": list(strats),
+            "confluence_strategy_ids": list(strat_ids),
             "reason": f"{strat_name} · M1+M5+M15 alinhados (Alvo {tp_atr}x vs Stop {sl_atr}x)",
         }
 
-    # Caso 2: Impulso de 2-3 Velas (2 a 3 min) — espaço livre >= 1.50 ATR
     if room_atr >= 1.50:
         dur_s = min(180, max(120, bar_remaining_s + tf_seconds * 2))
         sl_atr = 1.20
@@ -456,13 +776,17 @@ def _select_horizon(
             "tp_atr": tp_atr,
             "sl_atr": sl_atr,
             "strategy": strat_name,
+            "strategy_id": strat_id,
+            "confluence_strategies": list(strats),
+            "confluence_strategy_ids": list(strat_ids),
             "reason": f"{strat_name} · válido por {dur_s}s (Alvo {tp_atr}x > Stop {sl_atr}x)",
         }
 
-    # Caso 3: Tiro Sniper de 1-2 Velas (75s a 110s) — SEMPRE com Alvo (1.45x) > Stop (1.15x)!
     dur_s = min(110, max(75, bar_remaining_s + 60))
     sl_atr = 1.15
-    tp_atr = round(float(np.clip(max(1.45, room_atr * 0.78), 1.45, 1.65)), 2)
+    # Não projeta um alvo maior do que 90% do espaço real disponível quando o espaço é conhecido
+    max_feasible_tp = max(1.45, min(1.65, room_atr * 0.88)) if room_atr >= 1.15 else 1.45
+    tp_atr = round(float(max_feasible_tp), 2)
     return {
         "type": "SCALP_1VELA",
         "label": f"⚡ Tiro Sniper de Vela ({dur_s}s)",
@@ -472,6 +796,9 @@ def _select_horizon(
         "tp_atr": tp_atr,
         "sl_atr": sl_atr,
         "strategy": strat_name,
+        "strategy_id": strat_id,
+        "confluence_strategies": list(strats),
+        "confluence_strategy_ids": list(strat_ids),
         "reason": f"{strat_name} · previsão de {dur_s}s (Alvo {tp_atr}x > Stop {sl_atr}x)",
     }
 
@@ -487,21 +814,35 @@ def analyze(
     tf_seconds: int = 60,
     htf_m15_df: pd.DataFrame | None = None,
     server_now: int = 0,
+    calibration_lookup: dict | None = None,
 ) -> dict:
     if df is None or len(df) < 120 or tick is None or sym is None:
-        return {"ready": False, "study_block": "Carregando histórico de velas do MT5."}
+        return {"ready": False, "study_block": "Carregando histórico de velas do MT5 (mínimo 120 barras)."}
 
     last = df.iloc[-1]
-    atr = _f(last["atr"])
-    e9, e21, e200 = _f(last["ema9"]), _f(last["ema21"]), _f(last["ema200"])
+    atr = _f(last.get("atr"))
+    e9, e21, e200 = _f(last.get("ema9")), _f(last.get("ema21")), _f(last.get("ema200"))
     vwap_v = _f(last.get("vwap")) or e21
     vwap_std = _f(last.get("vwap_sd")) or atr
-    rsi_v, k_v, d_v = _f(last["rsi"]), _f(last["stoch_k"]), _f(last["stoch_d"])
-    adx_v, pdi, mdi = _f(last["adx"]), _f(last["plus_di"]), _f(last["minus_di"])
-    rvol = _f(last["rvol"]) or 0.0
+    rsi_v, k_v, d_v = _f(last.get("rsi")), _f(last.get("stoch_k")), _f(last.get("stoch_d"))
+    adx_v, pdi, mdi = _f(last.get("adx")), _f(last.get("plus_di")), _f(last.get("minus_di"))
+    rvol = _f(last.get("rvol"))
 
-    if not atr or atr <= 0 or None in (e9, e21, e200, vwap_v, rsi_v, k_v, d_v, adx_v, pdi, mdi):
-        return {"ready": False, "study_block": "Indicadores em aquecimento."}
+    if (
+        not atr
+        or atr <= 0
+        or None in (e9, e21, e200, vwap_v, rsi_v, k_v, d_v, adx_v, pdi, mdi, rvol)
+    ):
+        return {"ready": False, "study_block": "Indicadores em aquecimento ou com valores inválidos (NO_TRADE)."}
+
+    bid = _f(tick.get("bid"))
+    ask = _f(tick.get("ask"))
+    point = _f(sym.get("point"))
+    if not bid or not ask or bid <= 0 or ask < bid or not point or point <= 0:
+        return {"ready": False, "study_block": "Cotação bid/ask ou especificação point inválida (NO_TRADE)."}
+
+    tick_time = int(tick.get("time") or 0)
+    tick_stale = bool(server_now > 0 and tick_time > 0 and abs(server_now - tick_time) > MAX_TICK_AGE_S)
 
     closes = df["close"].to_numpy(dtype=float)
     highs = df["high"].to_numpy(dtype=float)
@@ -513,15 +854,13 @@ def analyze(
     vwaps = df["vwap"].to_numpy(dtype=float)
     atrs = df["atr"].to_numpy(dtype=float)
 
-    point = float(sym.get("point") or 1e-5)
     digits = int(sym.get("digits") or 5)
-    bid, ask = float(tick["bid"]), float(tick["ask"])
     spread_price = max(0.0, ask - bid)
-    spread_points = int(round(spread_price / point)) if point > 0 else 0
+    spread_points = int(round(spread_price / point))
     price = float(closes[-1])
 
     bar_time = int(last["time"])
-    now_ref = server_now if server_now > 0 else int(tick.get("time") or bar_time)
+    now_ref = server_now if server_now > 0 else (tick_time or bar_time)
     bar_elapsed_s = max(0, min(tf_seconds, now_ref - bar_time))
     bar_remaining_s = max(0, tf_seconds - bar_elapsed_s)
 
@@ -534,8 +873,8 @@ def analyze(
     accel = float(flow.get("acceleration") or 0.0)
     flow_ok = bool(flow.get("enough"))
 
-    htf_s = _htf_summary(htf_df)
-    htf_m15_s = _htf_summary(htf_m15_df) if htf_m15_df is not None else {"available": False, "trend": 0}
+    htf_s = _htf_summary(htf_df, server_now=now_ref, max_stale_s=1200)
+    htf_m15_s = _htf_summary(htf_m15_df, server_now=now_ref, max_stale_s=2700)
 
     cdl = _analyze_candles_and_strategies(
         opens,
@@ -557,44 +896,52 @@ def analyze(
         digits,
     )
 
-    # Espaço livre até o topo/fundo das últimas 24 velas (excluindo a vela atual)
-    swing_high = float(np.max(highs[-25:-1]))
-    swing_low = float(np.min(lows[-25:-1]))
-    room_up_atr = (swing_high - price) / atr if price < swing_high - 0.05 * atr else 2.20
-    room_dn_atr = (price - swing_low) / atr if price > swing_low + 0.05 * atr else 2.20
-    room_up_atr = float(np.clip(room_up_atr, 0.15, 2.80))
-    room_dn_atr = float(np.clip(room_dn_atr, 0.15, 2.80))
-
-    # Regime de mercado
-    if spread_price > 0.30 * atr or atr_ratio > 2.5:
-        regime = "HIGH_VOL"
-    elif cdl["buy_strategies"] and price >= e21:
-        regime = "PULLBACK_UP" if "Pullback" in cdl["buy_strategies"][0] or "SMC" in cdl["buy_strategies"][0] else "TREND_UP"
-    elif cdl["sell_strategies"] and price <= e21:
-        regime = "PULLBACK_DOWN" if "Pullback" in cdl["sell_strategies"][0] or "SMC" in cdl["sell_strategies"][0] else "TREND_DOWN"
-    elif adx_v >= 16 and pdi > mdi and price >= e21:
-        regime = "TREND_UP"
-    elif adx_v >= 16 and mdi > pdi and price <= e21:
-        regime = "TREND_DOWN"
-    else:
-        regime = "RANGE"
+    # Cálculo objetivo do espaço estrutural para compra e venda (Parte 2.10)
+    struct_up = classify_structural_room(opens, highs, lows, closes, atr, 1, htf_s)
+    struct_dn = classify_structural_room(opens, highs, lows, closes, atr, -1, htf_s)
 
     w = mode.weights
     max_spread = int(settings.get("max_spread_points", 25))
     atr_points = atr / max(point, 1e-9)
 
-    def build_side(d: int) -> tuple[list[dict], float, list[dict], dict, list[str]]:
+    ui_regime, detailed_regime = classify_market_regime(
+        price=price,
+        e9=e9,
+        e21=e21,
+        e200=e200,
+        adx_v=adx_v,
+        pdi=pdi,
+        mdi=mdi,
+        atr=atr,
+        atr_ratio=atr_ratio,
+        atr_points=atr_points,
+        spread_price=spread_price,
+        spread_points=spread_points,
+        max_spread=max_spread,
+        htf_m5=htf_s,
+        htf_m15=htf_m15_s,
+        flow_ok=flow_ok,
+        tick_stale=tick_stale,
+        buy_strats=cdl["buy_strategies"],
+        sell_strats=cdl["sell_strategies"],
+    )
+
+    def build_side(d: int) -> tuple[list[dict], float, list[dict], dict, list[str], dict]:
         side_up = d > 0
         prob_next = cdl["prob_up"] if side_up else cdl["prob_down"]
         vetoes = list(cdl["veto_buy"] if side_up else cdl["veto_sell"])
         strats = cdl["buy_strategies"] if side_up else cdl["sell_strategies"]
         has_strat = len(strats) > 0
         strat_label = strats[0] if has_strat else "Aguardando setup institucional"
-        room_atr = room_up_atr if side_up else room_dn_atr
+        struct_info = struct_up if side_up else struct_dn
+        room_atr = float(struct_info["room_atr"])
 
-        # Veto de volatilidade mínima: nunca opera quando a vela inteira tem menos de 6 pontos (0.6 pip)
+        if tick_stale:
+            vetoes.append(f"Cotação do ativo desatualizada ({abs(now_ref - tick_time)}s > {MAX_TICK_AGE_S}s)")
         if atr_points < 6.0:
             vetoes.append(f"Volatilidade muito baixa neste timeframe (ATR {atr_points:.1f} pts < 6 pts)")
+        if spread_points > max_spread:
+            vetoes.append(f"Spread atual ({spread_points} pts) acima do limite configurado ({max_spread} pts)")
 
         horizon = _select_horizon(
             d, cdl, htf_s, htf_m15_s, adx_v, room_atr, bar_remaining_s, tf_seconds, mode.timeframe
@@ -616,84 +963,88 @@ def analyze(
         p1 = _pillar(
             1,
             w[0],
-            f"{strat_label} · Próx. Vela: {prob_next:.0f}% {'ALTA' if side_up else 'BAIXA'}",
+            f"{strat_label} · Índice Dir. Heurístico: {prob_next:.0f}% {'ALTA' if side_up else 'BAIXA'}",
             [
                 (f"Estratégia ativa: {strat_label}", has_strat, 0.40),
-                (f"Probabilidade da próxima vela ≥ 66% ({prob_next:.0f}%)", prob_next >= 66.0, 0.35),
+                (f"Índice direcional da vela ≥ 66 ({prob_next:.0f})", prob_next >= 66.0, 0.35),
                 (f"Vela atual e pavios confirmando direção ({cdl['wick_desc']})", bool(b0_favor and wicks_ok), 0.25),
             ],
             continuous_score=p1_score,
         )
 
         # --- PILAR 2: Alinhamento Obrigatório de Tendência M1 + M5 + M15 (Peso 2.5) ---
+        # Parte 2.9: sem dados disponíveis de M5 ou M15 -> False!
         m1_trend_ok = (price >= e21 and e9 >= e21 - 0.05 * atr) if side_up else (price <= e21 and e9 <= e21 + 0.05 * atr)
-        m5_trend_ok = not htf_s["available"] or (htf_s["bias21"] * d > 0 and htf_s["bar_body_atr"] * d >= -0.10)
-        m15_trend_ok = not htf_m15_s["available"] or (htf_m15_s["trend"] * d >= 0)
+        m5_trend_ok = bool(htf_s["available"] and htf_s["bias21"] * d > 0 and htf_s["bar_body_atr"] * d >= -0.10)
+        m15_trend_ok = bool(htf_m15_s["available"] and htf_m15_s["trend"] * d >= 0)
 
         p2_score = (
             (0.40 if m1_trend_ok else 0.0)
             + (0.40 if m5_trend_ok else 0.0)
-            + (0.20 if m15_trend_ok else 0.05)
+            + (0.20 if m15_trend_ok else 0.0)
         )
         p2 = _pillar(
             2,
             w[1],
-            f"M1 {'A Favor' if m1_trend_ok else 'Contra'} · M5 {'A Favor' if m5_trend_ok else 'Contra'} · M15 {'A Favor' if m15_trend_ok else 'Contra'}",
+            (
+                f"M1 {'A Favor' if m1_trend_ok else 'Contra'} · "
+                f"M5 {'A Favor' if m5_trend_ok else ('Indisponível' if not htf_s['available'] else 'Contra')} · "
+                f"M15 {'A Favor' if m15_trend_ok else ('Indisponível' if not htf_m15_s['available'] else 'Contra')}"
+            ),
             [
                 ("Tendência M1 a favor (Preço e EMA 9/21 alinhados)", bool(m1_trend_ok), 0.40),
-                ("Tendência M5 obrigatoriamente a favor (Proibido Contra-Tendência)", bool(m5_trend_ok), 0.40),
-                ("Tendência Macro M15 alinhada", bool(m15_trend_ok), 0.20),
+                ("Tendência M5 validada e a favor (Dados obrigatórios presentes)", bool(m5_trend_ok), 0.40),
+                ("Tendência Macro M15 validada e alinhada", bool(m15_trend_ok), 0.20),
             ],
             continuous_score=p2_score,
         )
 
-        # --- PILAR 3: Espaço Livre até Topo/Fundo (R/R Positivo) (Peso 1.8) ---
-        broke_sr = (price >= swing_high) if side_up else (price <= swing_low)
-        enough_room = room_atr >= 1.15 or (broke_sr and (cdl["bull_impulse"] if side_up else cdl["bear_impulse"]))
+        # --- PILAR 3: Espaço Estrutural até Suporte/Resistência (Peso 1.8) ---
+        enough_room = bool(struct_info["confirmed"] and room_atr >= 1.15 and room_atr >= horizon["tp_atr"] * 0.75)
         if not enough_room:
-            vetoes.append(
-                f"Espaço curto até {'Resistência (Topo)' if side_up else 'Suporte (Fundo)'} ({room_atr:.2f} ATR < 1.15 ATR)"
-            )
-        p3_score = _clamp((room_atr - 0.50) / 1.30, 0.0, 1.0) if not broke_sr else 0.92
+            vetoes.append(struct_info["reason"])
+        p3_score = _clamp((room_atr - 0.50) / 1.30, 0.0, 1.0) if struct_info["confirmed"] else 0.15
         p3 = _pillar(
             3,
             w[2],
-            f"Espaço livre: {room_atr:.2f} ATR · Alvo {horizon['tp_atr']}x > Stop {horizon['sl_atr']}x",
+            f"{struct_info['status']} · Espaço: {room_atr:.2f} ATR · Alvo {horizon['tp_atr']}x > Stop {horizon['sl_atr']}x",
             [
-                (f"Espaço livre ≥ 1,15 ATR até topo/fundo ({room_atr:.2f} ATR)", bool(enough_room), 0.55),
-                (f"Retorno maior que o Risco (Alvo {horizon['tp_atr']}x vs Stop {horizon['sl_atr']}x)", horizon["tp_atr"] > horizon["sl_atr"] * 1.2, 0.45),
+                (f"Estrutura confirmada e espaço ≥ 1,15 ATR ({room_atr:.2f} ATR)", enough_room, 0.55),
+                (f"Retorno compatível com o espaço e maior que o Stop ({horizon['tp_atr']}x vs {horizon['sl_atr']}x)", horizon["tp_atr"] > horizon["sl_atr"] * 1.2, 0.45),
             ],
             continuous_score=p3_score,
         )
 
         # --- PILAR 4: Fluxo Real de Ticks & Ignição de Volume (Peso 1.4) ---
-        intrabar_push = d * cdl["b0_body"] >= 0.05 * atr or (cdl["broke_prev_high"] if side_up else cdl["broke_prev_low"])
-        flow_aligned = (flow_ok and d * delta >= 0.14) or (not flow_ok and intrabar_push and rvol >= 0.90)
-        if flow_ok and d * delta < -0.10:
+        flow_aligned = bool(flow_ok and d * delta >= 0.14)
+        if not flow_ok:
+            vetoes.append("Amostra de fluxo de ticks insuficiente para confirmar agressão")
+        elif d * delta < -0.10:
             vetoes.append(f"Fluxo de ticks em tempo real está contra ({delta * 100:+.0f}%)")
+
         if flow_ok:
             s_delta = _clamp((d * delta + 0.05) / 0.50, 0.0, 1.0)
             s_rvol = _clamp(rvol / 1.20, 0.25, 1.0)
             p4_score = _clamp(s_delta * 0.65 + s_rvol * 0.35)
         else:
-            p4_score = 0.68 if (intrabar_push and rvol >= 0.85) else 0.30
+            p4_score = 0.20
         p4 = _pillar(
             4,
             w[3],
-            f"Fluxo {delta * 100:+.0f}% · RVOL {rvol:.2f}x · Acel {accel:.2f}x",
+            f"Fluxo {delta * 100:+.0f}% ({'OK' if flow_ok else 'Amostra curta'}) · RVOL {rvol:.2f}x · Acel {accel:.2f}x",
             [
-                (f"Fluxo de ticks empurrando a favor ({delta * 100:+.0f}%)", bool(flow_aligned), 0.50),
+                (f"Fluxo de ticks validado e empurrando a favor ({delta * 100:+.0f}%)", flow_aligned, 0.50),
                 (f"Volume ativo na vela (RVOL {rvol:.2f}x ≥ {mode.rvol_min:.2f}x)", bool(rvol >= mode.rvol_min), 0.50),
             ],
             continuous_score=p4_score,
         )
 
-        # --- PILAR 5: Eficiência Matemática (Spread vs Alvo) (Peso 1.0) ---
+        # --- PILAR 5: Eficiência Matemática (Custos & Spread vs Alvo) (Peso 1.0) ---
         target_price = horizon["tp_atr"] * atr
         spread_to_tp = spread_price / max(target_price, 1e-9)
         spread_ok = spread_points <= max_spread and spread_to_tp <= 0.15 and atr_points >= 6.0
         if spread_to_tp > 0.16:
-            vetoes.append(f"Spread consome {spread_to_tp * 100:.0f}% do alvo (mínimo exigido ≤ 15%)")
+            vetoes.append(f"Spread consome {spread_to_tp * 100:.0f}% do alvo (máximo exigido ≤ 15%)")
         p5_score = _clamp(1.0 - (spread_to_tp / 0.20), 0.0, 1.0) if (spread_points <= max_spread and atr_points >= 6.0) else 0.0
         p5 = _pillar(
             5,
@@ -741,24 +1092,46 @@ def analyze(
 
         final_score = round(_clamp(raw_score, 0.0, 99.0), 1)
 
+        # Avaliação de famílias de indicadores sem redundância (Parte 4.2)
+        grouped_families_score = round(
+            100.0 * (p2_score * 0.30 + p3_score * 0.25 + p1_score * 0.20 + p4_score * 0.15 + p5_score * 0.10),
+            1,
+        )
+        # Versão desduplicada (remove Stoch/RSI duplicados de P6 e o peso duplo de edge em P1)
+        dedup_p1 = 1.0 if has_strat and b0_favor and wicks_ok else (0.5 if has_strat else 0.0)
+        dedup_p6 = 1.0 if not_overextended else 0.0
+        de_duplicated_score = round(
+            100.0 * (p2_score * 0.30 + p3_score * 0.25 + dedup_p1 * 0.20 + p4_score * 0.15 + dedup_p6 * 0.10),
+            1,
+        )
+        minimal_core_score = round(100.0 * (p2_score * 0.40 + p3_score * 0.35 + p5_score * 0.25), 1)
+
+        model_variants = {
+            "current_v5": final_score,
+            "grouped_families": grouped_families_score,
+            "de_duplicated": de_duplicated_score,
+            "minimal_core": minimal_core_score,
+            "structural_room_status": struct_info["status"],
+        }
+
         gates = [
             {"label": f"Estratégia Institucional confirmada ({strat_label})", "ok": has_strat and len(vetoes) == 0},
-            {"label": f"Favor da Tendência M1 + M5 (Proibido Contra-Tendência)", "ok": m1_trend_ok and m5_trend_ok},
-            {"label": f"Espaço livre ≥ 1,15 ATR ({room_atr:.2f} ATR) & Alvo > Stop", "ok": enough_room},
-            {"label": f"Spread baixo ({spread_to_tp * 100:.0f}% do alvo ≤ 15%) & ATR ativo", "ok": spread_ok},
+            {"label": "Favor da Tendência M1 + M5 + M15 (Com dados válidos)", "ok": m1_trend_ok and m5_trend_ok and m15_trend_ok},
+            {"label": f"Espaço estrutural confirmado ≥ 1,15 ATR ({room_atr:.2f} ATR)", "ok": enough_room},
+            {"label": f"Spread baixo ({spread_to_tp * 100:.0f}% do alvo ≤ 15%), Fluxo e ATR ativos", "ok": spread_ok and flow_aligned},
             {"label": f"Pilares institucionais aprovados ({greens}/6 ≥ {mode.min_green_pillars})", "ok": greens >= mode.min_green_pillars},
         ]
-        return ps, final_score, gates, horizon, vetoes
+        return ps, final_score, gates, horizon, vetoes, model_variants
 
-    p_buy, s_buy, g_buy, h_buy, v_buy = build_side(1)
-    p_sell, s_sell, g_sell, h_sell, v_sell = build_side(-1)
+    p_buy, s_buy, g_buy, h_buy, v_buy, mv_buy = build_side(1)
+    p_sell, s_sell, g_sell, h_sell, v_sell, mv_sell = build_side(-1)
 
     if s_buy >= s_sell:
         d_best = 1
-        ps, score, gates, horizon, vetoes_active = p_buy, s_buy, g_buy, h_buy, v_buy
+        ps, score, gates, horizon, vetoes_active, mv_best = p_buy, s_buy, g_buy, h_buy, v_buy, mv_buy
     else:
         d_best = -1
-        ps, score, gates, horizon, vetoes_active = p_sell, s_sell, g_sell, h_sell, v_sell
+        ps, score, gates, horizon, vetoes_active, mv_best = p_sell, s_sell, g_sell, h_sell, v_sell, mv_sell
 
     all_gates = all(x["ok"] for x in gates)
     signal = ("BUY" if d_best > 0 else "SELL") if (score >= mode.min_score and all_gates and not vetoes_active) else None
@@ -771,15 +1144,40 @@ def analyze(
         if failed:
             study_block = "Aguardando: " + failed[0]
 
+    # Calibração de probabilidade (Parte 4.1: só informa probabilidade calibrada se houver amostra OOS validada)
+    cal_info = {
+        "score_type": "HEURISTIC_CONFLUENCE",
+        "probability_status": "UNCALIBRATED",
+        "calibrated_win_prob": None,
+        "sample_size": 0,
+        "brier_score": None,
+        "note": "Pontuação heurística de confluência (não representa probabilidade real de acerto sem calibração fora da amostra).",
+    }
+    if calibration_lookup and isinstance(calibration_lookup, dict):
+        n_oos = int(calibration_lookup.get("sample_size") or 0)
+        if n_oos >= 30 and calibration_lookup.get("calibrated_win_prob") is not None:
+            cal_info.update({
+                "probability_status": "CALIBRATED_OOS",
+                "calibrated_win_prob": round(float(calibration_lookup["calibrated_win_prob"]), 1),
+                "sample_size": n_oos,
+                "brier_score": calibration_lookup.get("brier_score"),
+                "note": f"Calibrada em {n_oos} operações fora da amostra.",
+            })
+        elif n_oos > 0:
+            cal_info["probability_status"] = "INSUFFICIENT_SAMPLE"
+            cal_info["sample_size"] = n_oos
+
     return {
         "ready": True,
+        "algo_version": ALGO_VERSION,
         "mode": mode.key,
         "timeframe": mode.timeframe,
         "htf_tf": mode.htf,
         "spread_points": spread_points,
         "regime": {
-            "code": regime,
-            "label": REGIME_PT.get(regime, regime),
+            "code": ui_regime,
+            "detailed_code": detailed_regime,
+            "label": REGIME_PT.get(detailed_regime, REGIME_PT.get(ui_regime, ui_regime)),
             "adx": round(adx_v, 2),
             "plus_di": round(pdi, 2),
             "minus_di": round(mdi, 2),
@@ -792,8 +1190,12 @@ def analyze(
         "candle": cdl,
         "horizon": horizon,
         "score": score,
+        "confluence_score": score,
         "score_buy": s_buy,
         "score_sell": s_sell,
+        "calibration": cal_info,
+        "model_variants": mv_best,
+        "structure": struct_up if d_best > 0 else struct_dn,
         "direction": "BUY" if d_best > 0 else "SELL",
         "signal": signal,
         "pillars": ps,
@@ -820,6 +1222,7 @@ def analyze(
             "rvol": round(rvol, 2),
         },
         "htf": htf_s,
+        "htf_m15": htf_m15_s,
     }
 
 
@@ -831,11 +1234,11 @@ def analyze_multi_horizon(
     base_mode: ModeConfig,
     settings: dict,
     server_now: int = 0,
+    calibration_lookup: dict | None = None,
 ) -> dict:
     """
-    MEGA BRAIN V4 Multi-Horizonte:
-    Avalia M1, M2 e M5 simultaneamente com as 5 Estratégias Institucionais e seleciona
-    o horizonte onde a tendência M1+M5+M15 e a vela oferecem a maior assertividade real.
+    MEGA BRAIN V5 Multi-Horizonte:
+    Avalia M1, M2 e M5 simultaneamente com validação rigorosa de M5 e M15.
     """
     from dataclasses import replace
     from .config import TF_SECONDS
@@ -849,19 +1252,19 @@ def analyze_multi_horizon(
 
     if m1_df is not None and len(m1_df) >= 120:
         m_m1 = replace(base_mode, timeframe="M1", htf="M5")
-        a1 = analyze(m1_df, m5_df, tick, sym, flow, m_m1, settings, TF_SECONDS["M1"], m15_df, server_now)
+        a1 = analyze(m1_df, m5_df, tick, sym, flow, m_m1, settings, TF_SECONDS["M1"], m15_df, server_now, calibration_lookup)
         if a1.get("ready"):
             candidates.append(a1)
 
     if m2_df is not None and len(m2_df) >= 120:
         m_m2 = replace(base_mode, timeframe="M2", htf="M5")
-        a2 = analyze(m2_df, m5_df, tick, sym, flow, m_m2, settings, TF_SECONDS["M2"], m15_df, server_now)
+        a2 = analyze(m2_df, m5_df, tick, sym, flow, m_m2, settings, TF_SECONDS["M2"], m15_df, server_now, calibration_lookup)
         if a2.get("ready"):
             candidates.append(a2)
 
     if m5_df is not None and len(m5_df) >= 120:
         m_m5 = replace(base_mode, timeframe="M5", htf="M15")
-        a5 = analyze(m5_df, m15_df, tick, sym, flow, m_m5, settings, TF_SECONDS["M5"], m15_df, server_now)
+        a5 = analyze(m5_df, m15_df, tick, sym, flow, m_m5, settings, TF_SECONDS["M5"], m15_df, server_now, calibration_lookup)
         if a5.get("ready"):
             candidates.append(a5)
 
@@ -885,6 +1288,7 @@ def analyze_multi_horizon(
             "signal": c["signal"],
             "horizon": c.get("horizon", {}).get("short_label", c["timeframe"]),
             "duration_s": c.get("horizon", {}).get("duration_s", 90),
+            "strategy": c.get("horizon", {}).get("strategy", ""),
         }
         for c in candidates
     ]
